@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <IPAddress.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/stream_buffer.h>
 
@@ -18,6 +19,9 @@ public:
 
     // Returns true if a client is connected.
     bool clientConnected() const;
+
+    // IP address of the connected client; 0.0.0.0 if none.
+    IPAddress clientIP() const;
 
     // Send a single byte to the connected client (no-op if none). IAC
     // (0xFF) gets escaped per RFC 854.

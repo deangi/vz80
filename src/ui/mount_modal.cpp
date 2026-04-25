@@ -144,12 +144,13 @@ void MountModal::renderList() {
 }
 
 void MountModal::renderActions() {
-    struct { const char* label; uint16_t bg; int x, w; } btns[3] = {
-        { "CANCEL", TFT_MAROON,    0,   105 },
-        { "UNMNT",  TFT_DARKGREY, 107,  105 },
-        { "OK",     TFT_DARKGREEN,214,  106 }
+    struct { const char* label; uint16_t bg; int x, w; } btns[4] = {
+        { "CANCEL", TFT_MAROON,     0,  80 },
+        { "UNMNT",  TFT_DARKGREY,  80,  80 },
+        { "NEW",    TFT_NAVY,     160,  80 },
+        { "OK",     TFT_DARKGREEN,240,  80 }
     };
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         lcd_->fillRect(btns[i].x + 1, kActionY + 1,
                        btns[i].w - 2, kActionH - 2, btns[i].bg);
         lcd_->drawRect(btns[i].x, kActionY, btns[i].w, kActionH, TFT_DARKGREY);
@@ -161,6 +162,46 @@ void MountModal::renderActions() {
                          kActionY + kActionH / 2);
     }
     lcd_->setTextSize(1);
+}
+
+bool MountModal::createNewDisk() {
+    // Find first unused name newdisk_NNN.dsk (001..999).
+    char name[24];
+    char path[32];
+    for (int n = 1; n < 1000; ++n) {
+        snprintf(name, sizeof(name), "newdisk_%03d.dsk", n);
+        snprintf(path, sizeof(path), "/%s", name);
+        if (!SD.exists(path)) break;
+        if (n == 999) {
+            Serial.println("[mount] no free newdisk_NNN slot");
+            return false;
+        }
+    }
+
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) { Serial.printf("[mount] create %s FAIL\n", path); return false; }
+
+    // 256,256 bytes = 250 * 1024 + 256. Fill with 0xE5 — CP/M's "blank
+    // sector" pattern (deleted/empty directory entries). A zero-filled
+    // image would look to CCP like 32 garbage entries; 0xE5 makes the
+    // disk immediately usable without running FORMAT first.
+    static const size_t kTotal = 256u * 1024u + 256u;  // == 256256
+    uint8_t blank[1024];
+    memset(blank, 0xE5, sizeof(blank));
+    size_t written = 0;
+    while (written < kTotal) {
+        size_t chunk = (kTotal - written) >= sizeof(blank) ? sizeof(blank)
+                                                           : (kTotal - written);
+        if (f.write(blank, chunk) != chunk) {
+            Serial.printf("[mount] write %s short at %u\n", path, (unsigned)written);
+            f.close();
+            return false;
+        }
+        written += chunk;
+    }
+    f.close();
+    Serial.printf("[mount] created %s (%u bytes)\n", path, (unsigned)kTotal);
+    return true;
 }
 
 // -------- hit test ---------------------------------------------------------
@@ -196,10 +237,18 @@ MountModal::Result MountModal::hitTest(int x, int y) {
         }
         return Result::CONTINUE;
     }
-    // Action buttons
+    // Action buttons (4 x 80px)
     if (y >= kActionY && y < kActionY + kActionH) {
-        if (x < 105)       return Result::CANCEL;
-        if (x < 212)       return Result::UNMOUNT;
+        if (x < 80)        return Result::CANCEL;
+        if (x < 160)       return Result::UNMOUNT;
+        if (x < 240) {
+            // NEW handled internally — create file, refresh list, stay open.
+            createNewDisk();
+            scanFiles();
+            renderScrollBar();
+            renderList();
+            return Result::CONTINUE;
+        }
         return Result::OK;
     }
     return Result::CONTINUE;

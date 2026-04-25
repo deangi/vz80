@@ -38,12 +38,18 @@
 #include "src/cpm/altair_bios.h"
 #include "src/ui/touch_panel.h"
 #include "src/ui/mount_modal.h"
+#include "src/ui/setup_modal.h"
 #include "src/input/bt_keyboard.h"
 #include "src/network/wifi_sta.h"
 #include "src/network/telnet_server.h"
 #include "src/network/ftp_server.h"
 
 extern void BtKeyboardTick();  // defined in bt_keyboard.cpp
+
+// Build identification — bumped on user-visible changes. Shown in the
+// SETUP popup so the running build is obvious without checking serial.
+static const char VZ80_VERSION[]    = "1.1";
+static const char VZ80_BUILD_DATE[] = "2026-04-25";
 
 // Override Arduino-ESP32's weak btInUse() so initArduino() does NOT call
 // esp_bt_controller_mem_release(BTDM) before setup() runs. Must live in
@@ -74,6 +80,7 @@ static DiskImage   diskA;
 static DiskImage   diskB;
 static TouchPanel  touchPanel;
 static MountModal  mountModal;
+static SetupModal  setupModal;
 
 static StreamBufferHandle_t txStream = nullptr;  // Z80 -> display
 static StreamBufferHandle_t rxStream = nullptr;  // keyboard -> Z80
@@ -83,6 +90,7 @@ static bool         z80Running    = false;
 
 static char cfgDriveA[64] = "altair48k.dsk";
 static char cfgDriveB[64] = "";
+static char cfgAppName[24] = "vZ80";  // shown as title in the top strip
 
 // Network config (M7). Loaded from /config.json; empty SSID disables WiFi.
 static char cfgWifiSsid[33] = "";
@@ -146,6 +154,7 @@ static bool loadConfig() {
     cfgFtpEnabled    = doc["ftp"]["enabled"]    | true;
     cfgTelnetEnabled = doc["telnet"]["enabled"] | true;
     cfgTelnetPort    = doc["telnet"]["port"]    | 23;
+    copyCfgStr(cfgAppName, sizeof(cfgAppName),  doc["app"]["name"] | "vZ80");
 
     Serial.printf("cfg A:=%s B:=%s\n", cfgDriveA, cfgDriveB);
     Serial.printf("cfg wifi=%s ftp=%s telnet=%s:%u\n",
@@ -201,7 +210,6 @@ static void z80Suspend() {
     if (z80TaskHandle && z80Running) {
         vTaskSuspend(z80TaskHandle);
         z80Running = false;
-        touchPanel.setRunning(false);
     }
 }
 
@@ -209,7 +217,6 @@ static void z80Resume() {
     if (z80TaskHandle && !z80Running) {
         vTaskResume(z80TaskHandle);
         z80Running = true;
-        touchPanel.setRunning(true);
     }
 }
 
@@ -233,6 +240,22 @@ static void doScroll() {
     console.markAllDirty();
 }
 
+static void doBtPair() {
+    using S = BtKeyboard::State;
+    S st = gBtKbd.state();
+    if (st == S::Off)        { console.puts("[BT] stack not up\n"); console.render(); return; }
+    if (st == S::Connected)  { console.puts("[BT] already connected\n"); console.render(); return; }
+    if (st == S::Pairing)    { console.puts("[BT] already pairing\n"); console.render(); return; }
+    console.puts("[BT] pairing 20s - make kbd discoverable\n");
+    console.render();
+    Serial.println("[BT] suspending Z80 for BT bringup");
+    Serial.flush();
+    bool wasRunning = z80Running;
+    if (wasRunning) z80Suspend();
+    gBtKbd.startPairing();
+    if (wasRunning) z80Resume();
+}
+
 static void handleMount() {
     z80Suspend();
     mountModal.open(&lcd);
@@ -254,6 +277,48 @@ static void handleMount() {
     touchPanel.render();
     console.markAllDirty();
     console.render();
+    z80Resume();
+}
+
+static void handleSetup() {
+    z80Suspend();
+    setupModal.open(&lcd);
+    SetupModal::Result r;
+    while ((r = setupModal.poll()) == SetupModal::Result::CONTINUE) {
+        delay(15);
+    }
+    setupModal.close();
+
+    // Redraw the main UI before dispatching, so any handler that further
+    // suspends/redraws starts from a clean state.
+    lcd.fillScreen(TFT_BLACK);
+    touchPanel.render();
+    console.markAllDirty();
+    console.render();
+
+    switch (r) {
+    case SetupModal::Result::REBOOT:
+        // doBoot suspends Z80 itself; we already did, so just call it
+        // — the Resume will be paired correctly inside doBoot.
+        z80Resume();   // pair our suspend; doBoot does its own pair
+        doBoot();
+        return;
+    case SetupModal::Result::MOUNT:
+        z80Resume();
+        handleMount();
+        return;
+    case SetupModal::Result::CLEAR:
+        console.clear();
+        console.render();
+        break;
+    case SetupModal::Result::BT:
+        z80Resume();
+        doBtPair();
+        return;
+    case SetupModal::Result::CANCEL:
+    default:
+        break;
+    }
     z80Resume();
 }
 
@@ -305,7 +370,8 @@ static void pollBootButton() {
 void setup() {
     Serial.begin(115200);
     delay(100);
-    Serial.println("\n=== vZ80 booting (M5) ===");
+    Serial.printf("\n=== vZ80 v%s (%s) booting ===\n",
+                  VZ80_VERSION, VZ80_BUILD_DATE);
     Serial.println("press BOOT at any time to recalibrate touch");
 
     pinMode(PIN_BOOT_BUTTON, INPUT_PULLUP);
@@ -333,6 +399,8 @@ void setup() {
     if (!coldBootCpm()) fatal("BOOT");
 
     if (!touchPanel.begin(&lcd)) fatal("TOUCH");
+    touchPanel.setTitle(cfgAppName);
+    setupModal.setVersion(VZ80_VERSION, VZ80_BUILD_DATE);
 
     // BT keyboard: "begin" only records the rx stream and flags ready.
     // The actual Bluedroid/HID stack isn't brought up until the user taps
@@ -415,27 +483,43 @@ void loop() {
 
     gTelnet.tick();
 
-    // Refresh network status footer once a second.
+    // Refresh top-strip status (wifi line + bt/telnet line) once a second.
     static uint32_t nextNetStatus_ms = 0;
     if ((int32_t)(millis() - nextNetStatus_ms) >= 0) {
         nextNetStatus_ms = millis() + 1000;
-        char line[64];
+        char wline[40];
+        char bline[40];
+
+        // Line 1: WiFi
         if (!cfgWifiSsid[0]) {
-            touchPanel.setStatus("net: off", TFT_DARKGREY, TFT_BLACK);
+            snprintf(wline, sizeof(wline), "wifi: off");
         } else if (!WifiSta::connected()) {
-            snprintf(line, sizeof(line), "wifi: %s ...", cfgWifiSsid);
-            touchPanel.setStatus(line, TFT_ORANGE, TFT_BLACK);
+            snprintf(wline, sizeof(wline), "wifi: %s ...", cfgWifiSsid);
         } else {
-            const char* tel = !cfgTelnetEnabled ? "tel:off"
-                            : gTelnet.clientConnected() ? "tel+" : "tel:.";
-            const char* ftp = !ENABLE_FTP   ? "ftp:off"
-                            : Ftp::running() ? "ftp+"
-                                             : "ftp:-";
-            snprintf(line, sizeof(line), "%s  %s  %s",
-                     WifiSta::localIP().toString().c_str(),
-                     ftp, tel);
-            touchPanel.setStatus(line, TFT_GREEN, TFT_BLACK);
+            snprintf(wline, sizeof(wline), "wifi: %s",
+                     WifiSta::localIP().toString().c_str());
         }
+
+        // Line 2: BT keyboard + telnet client
+        const char* btTxt;
+        switch (gBtKbd.state()) {
+        case BtKeyboard::State::Off:        btTxt = "bt:off";       break;
+        case BtKeyboard::State::Idle:       btTxt = "bt:.";         break;
+        case BtKeyboard::State::Pairing:    btTxt = "bt:pair";      break;
+        case BtKeyboard::State::Connecting: btTxt = "bt:conn..";    break;
+        case BtKeyboard::State::Connected:  btTxt = "bt:kbd";       break;
+        default:                            btTxt = "bt:?";         break;
+        }
+        if (!cfgTelnetEnabled) {
+            snprintf(bline, sizeof(bline), "%s  tel:off", btTxt);
+        } else if (gTelnet.clientConnected()) {
+            snprintf(bline, sizeof(bline), "%s  tel:%s", btTxt,
+                     gTelnet.clientIP().toString().c_str());
+        } else {
+            snprintf(bline, sizeof(bline), "%s  tel:.", btTxt);
+        }
+
+        touchPanel.setStatus(wline, bline);
     }
 
     // Z80 -> console (display + serial echo + telnet client).
@@ -452,39 +536,8 @@ void loop() {
 
     // Touch panel actions.
     switch (touchPanel.poll()) {
-        case TouchPanel::Action::RUN_TOGGLE:
-            if (z80Running) z80Suspend(); else z80Resume();
-            break;
-        case TouchPanel::Action::BOOT:   doBoot();         break;
-        case TouchPanel::Action::CLEAR:  console.clear(); console.render(); break;
-        case TouchPanel::Action::SCROLL: doScroll();       break;
-        case TouchPanel::Action::MOUNT:  handleMount();    break;
-        case TouchPanel::Action::BT: {
-            using S = BtKeyboard::State;
-            S st = gBtKbd.state();
-            if (st == S::Off) {
-                console.puts("[BT] stack not up (M6 disabled?)\n");
-                console.render();
-            } else if (st == S::Connected) {
-                console.puts("[BT] already connected\n");
-                console.render();
-            } else if (st == S::Pairing) {
-                console.puts("[BT] pairing window already open\n");
-                console.render();
-            } else {
-                console.puts("[BT] pairing 20s - make kbd discoverable\n");
-                console.render();
-                Serial.println("[BT] button pressed, suspending Z80 for BT bringup");
-                Serial.flush();
-                bool wasRunning = z80Running;
-                if (wasRunning) z80Suspend();
-                gBtKbd.startPairing();
-                if (wasRunning) z80Resume();
-                Serial.println("[BT] Z80 resumed");
-                Serial.flush();
-            }
-            break;
-        }
+        case TouchPanel::Action::SETUP:  handleSetup(); break;
+        case TouchPanel::Action::SCROLL: doScroll();    break;
         case TouchPanel::Action::NONE:   break;
     }
 

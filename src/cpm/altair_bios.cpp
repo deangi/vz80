@@ -45,13 +45,19 @@ bool AltairBios::handleOut(z80* z, uint8_t port) {
             dmaAddr_ = ((uint16_t)z->b << 8) | z->c;
             return true;
 
-        case 0xC4:  // pREAD : Z=success
-            z->zf = doRead(z);
+        case 0xC4: {  // pREAD : A=0 ok / A=1 fail (also Z flag for legacy)
+            bool ok = doRead(z);
+            z->a  = ok ? 0 : 1;
+            z->zf = ok ? 1 : 0;
             return true;
+        }
 
-        case 0xC5:  // pWRITE : Z=success
-            z->zf = doWrite(z);
+        case 0xC5: {  // pWRITE : A=0 ok / A=1 fail (also Z flag for legacy)
+            bool ok = doWrite(z);
+            z->a  = ok ? 0 : 1;
+            z->zf = ok ? 1 : 0;
             return true;
+        }
 
         default:
             return false;

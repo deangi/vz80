@@ -37,6 +37,12 @@ bool TelnetServer::clientConnected() const {
     return c && c->connected();
 }
 
+IPAddress TelnetServer::clientIP() const {
+    if (!haveClient_) return IPAddress();
+    auto* c = static_cast<WiFiClient*>(client_);
+    return c ? c->remoteIP() : IPAddress();
+}
+
 void TelnetServer::disconnect() {
     if (haveClient_) {
         auto* c = static_cast<WiFiClient*>(client_);
@@ -64,13 +70,8 @@ void TelnetServer::doNegotiation() {
 
 void TelnetServer::readFromClient() {
     auto* c = static_cast<WiFiClient*>(client_);
-    int avail = c->available();
-    if (avail > 0) {
-        Serial.printf("[telnet] %d bytes from client:", avail);
-    }
     while (c->available()) {
         uint8_t b = (uint8_t)c->read();
-        Serial.printf(" %02x", b);
         switch (iacState_) {
         case IacState::Data:
             if (b == IAC) iacState_ = IacState::Iac;
@@ -120,7 +121,6 @@ void TelnetServer::readFromClient() {
             break;
         }
     }
-    if (avail > 0) Serial.println();
 }
 
 void TelnetServer::tick() {

@@ -111,6 +111,8 @@ void Z80CPU::s_out(z80* z, uint8_t port, uint8_t val) {
         if (self->bios_) self->bios_->handleOut(z, port);
         return;
     }
+    // (Status register conventions are set inside AltairBios::handleOut —
+    // it writes z->a and z->zf so the BIOS can check either.)
 
     switch (port) {
         case PORT_SIO_DATA:

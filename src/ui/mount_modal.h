@@ -64,5 +64,9 @@ private:
     void renderList();
     void renderActions();
 
+    // Create a new empty 256,256-byte .dsk file on SD with a unique name
+    // (newdisk_NNN.dsk, NNN auto-incremented). Returns true on success.
+    bool createNewDisk();
+
     Result hitTest(int x, int y);
 };
