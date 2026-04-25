@@ -48,7 +48,7 @@ extern void BtKeyboardTick();  // defined in bt_keyboard.cpp
 
 // Build identification — bumped on user-visible changes. Shown in the
 // SETUP popup so the running build is obvious without checking serial.
-static const char VZ80_VERSION[]    = "1.1";
+static const char VZ80_VERSION[]    = "1.2";
 static const char VZ80_BUILD_DATE[] = "2026-04-25";
 
 // Override Arduino-ESP32's weak btInUse() so initArduino() does NOT call
@@ -76,8 +76,7 @@ static SPIClass    sdSPI(HSPI);
 static Console     console;
 static Z80CPU      cpu;
 static AltairBios  bios;
-static DiskImage   diskA;
-static DiskImage   diskB;
+static DiskImage   disks[4];   // A, B, C, D
 static TouchPanel  touchPanel;
 static MountModal  mountModal;
 static SetupModal  setupModal;
@@ -88,8 +87,7 @@ static StreamBufferHandle_t rxStream = nullptr;  // keyboard -> Z80
 static TaskHandle_t z80TaskHandle = nullptr;
 static bool         z80Running    = false;
 
-static char cfgDriveA[64] = "altair48k.dsk";
-static char cfgDriveB[64] = "";
+static char cfgDrives[4][64] = { "altair48k.dsk", "", "", "" };
 static char cfgAppName[24] = "vZ80";  // shown as title in the top strip
 
 // Network config (M7). Loaded from /config.json; empty SSID disables WiFi.
@@ -142,10 +140,12 @@ static bool loadConfig() {
     f.close();
     if (err) { Serial.printf("config: %s\n", err.c_str()); return false; }
 
-    const char* a = doc["drives"]["A"] | "";
-    const char* b = doc["drives"]["B"] | "";
-    if (*a) copyCfgStr(cfgDriveA, sizeof(cfgDriveA), a);
-    if (*b) copyCfgStr(cfgDriveB, sizeof(cfgDriveB), b);
+    static const char* kKeys[4] = { "A", "B", "C", "D" };
+    for (int i = 0; i < 4; ++i) {
+        const char* p = doc["drives"][kKeys[i]] | "";
+        if (*p) copyCfgStr(cfgDrives[i], sizeof(cfgDrives[i]), p);
+        else    cfgDrives[i][0] = 0;
+    }
 
     copyCfgStr(cfgWifiSsid, sizeof(cfgWifiSsid), doc["wifi"]["ssid"]     | "");
     copyCfgStr(cfgWifiPass, sizeof(cfgWifiPass), doc["wifi"]["password"] | "");
@@ -156,7 +156,8 @@ static bool loadConfig() {
     cfgTelnetPort    = doc["telnet"]["port"]    | 23;
     copyCfgStr(cfgAppName, sizeof(cfgAppName),  doc["app"]["name"] | "vZ80");
 
-    Serial.printf("cfg A:=%s B:=%s\n", cfgDriveA, cfgDriveB);
+    Serial.printf("cfg A:=%s B:=%s C:=%s D:=%s\n",
+                  cfgDrives[0], cfgDrives[1], cfgDrives[2], cfgDrives[3]);
     Serial.printf("cfg wifi=%s ftp=%s telnet=%s:%u\n",
                   cfgWifiSsid[0] ? cfgWifiSsid : "(off)",
                   cfgFtpUser,
@@ -165,33 +166,63 @@ static bool loadConfig() {
 }
 
 // Mount a drive from path (no leading slash). Returns true on success.
+// .dsk files use the iCOM 3712 floppy geometry (77x26x128 = 256,256 bytes).
+// .hdd files keep the 26x128 sector layout but derive track count from
+// file size — supports larger CP/M hard-disk images on drives C/D.
 static bool mountDrive(uint8_t drive, const char* name) {
-    DiskImage* img = (drive == 0) ? &diskA : (drive == 1) ? &diskB : nullptr;
-    if (!img) return false;
+    if (drive >= 4) return false;
+    DiskImage* img = &disks[drive];
     if (!name || !*name) { bios.unmount(drive); img->close(); return true; }
     char path[80];
     snprintf(path, sizeof(path), "/%s", name);
     img->close();
-    if (!img->open(path)) {
+
+    uint16_t tracks = 77;       // floppy default
+    uint8_t  spt    = 26;
+    uint16_t bytes  = 128;
+    size_t   nlen = strlen(name);
+    if (nlen >= 4 && strcasecmp(name + nlen - 4, ".hdd") == 0) {
+        File probe = SD.open(path, FILE_READ);
+        if (!probe) {
+            Serial.printf("mount %c: probe FAIL %s\n", 'A' + drive, path);
+            return false;
+        }
+        size_t sz = probe.size();
+        probe.close();
+        // 26 sectors x 128 bytes per track = 3328 bytes/track. Round down.
+        uint32_t trks = sz / (26u * 128u);
+        if (trks < 1)    trks = 1;
+        if (trks > 4095) trks = 4095;
+        tracks = (uint16_t)trks;
+        Serial.printf("[hdd] %s size=%u -> %u trk x 26 x 128\n",
+                      name, (unsigned)sz, tracks);
+    }
+
+    if (!img->open(path, tracks, spt, bytes, true)) {
         Serial.printf("mount %c: FAIL %s\n", 'A' + drive, path);
         return false;
     }
     bios.mount(drive, img);
-    Serial.printf("%c: <- %s (%u trk x %u sec)\n",
-                  'A' + drive, path, img->tracks(), img->sectorsPerTrack());
+    Serial.printf("%c: <- %s (%u trk x %u sec x %u byte)\n",
+                  'A' + drive, path, img->tracks(),
+                  img->sectorsPerTrack(), img->sectorBytes());
     return true;
 }
 
 // Cold-boot CP/M: read trk0 sec1 of A: to 0x0080, set PC, install stubs.
 static bool coldBootCpm() {
-    if (!diskA.isOpen() && !mountDrive(0, cfgDriveA)) return false;
-    if (cfgDriveB[0] && !diskB.isOpen()) mountDrive(1, cfgDriveB);
+    if (!disks[0].isOpen() && !mountDrive(0, cfgDrives[0])) return false;
+    for (int d = 1; d < 4; ++d) {
+        if (cfgDrives[d][0] && !disks[d].isOpen()) {
+            mountDrive(d, cfgDrives[d]);  // non-fatal if a 2nd drive fails
+        }
+    }
 
     bios.resetState();
     bios.installStubs(cpu.ram());
 
     uint8_t boot[128];
-    if (!diskA.readSector(0, 1, boot)) { Serial.println("trk0 sec1 FAIL"); return false; }
+    if (!disks[0].readSector(0, 1, boot)) { Serial.println("trk0 sec1 FAIL"); return false; }
     cpu.loadProgram(0x0080, boot, sizeof(boot));
     cpu.reset(0x0080);
     return true;

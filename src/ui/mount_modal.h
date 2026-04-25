@@ -24,8 +24,9 @@ public:
         return (sel_ >= 0 && sel_ < nFiles_) ? files_[sel_] : nullptr;
     }
 
-    // C:/D: support requires HDD geometry we haven't pinned down yet.
-    static bool driveSupported(uint8_t d) { return d < 2; }
+    // All four drives mountable. .hdd files use auto-detected geometry
+    // (26 sec x 128 byte, tracks derived from file size).
+    static bool driveSupported(uint8_t d) { return d < 4; }
 
 private:
     // Layout constants — k-prefixed to dodge #define collisions from the
