@@ -1,0 +1,28 @@
+# Local Claude Code state
+.claude/
+
+# Local config (lives on SD, contains wifi/ftp creds)
+config.json
+
+# CP/M / Altair disk images (large, user-specific)
+*.dsk
+*.hdd
+*.img
+*.bin
+data/*
+!data/.gitkeep
+
+# Touch panel calibration (per-device)
+touch_cal.bin
+
+# Arduino IDE build artifacts
+build/
+*.elf
+*.hex
+*.map
+*.partitions
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
