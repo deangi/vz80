@@ -1,0 +1,9 @@
+{
+  "wifi":      { "ssid": "YOUR_WIFI_SSID", "password": "YOUR_WIFI_PASSWORD" },
+  "ftp":       { "user": "esp32", "password": "esp32", "enabled": false },
+  "telnet":    { "enabled": true, "port": 23 },
+  "drives":    { "A": "altair48k.dsk", "B": "", "C": "", "D": "" },
+  "bluetooth": { "keyboard_name": "", "keyboard_mac": "" },
+  "display":   { "brightness": 100, "scroll_anchor": "left" },
+  "app":       { "name": "vZ80", "version": "1.0.0" }
+}
