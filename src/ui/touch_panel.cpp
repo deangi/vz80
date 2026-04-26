@@ -66,7 +66,7 @@ void TouchPanel::drawStatus() {
     lcd_->setCursor(kMidX + 2, kStatY);
     lcd_->print(wifiLine_);
     lcd_->setCursor(kMidX + 2, kStatY + 8);
-    lcd_->print(btTelLine_);
+    lcd_->print(telLine_);
 }
 
 void TouchPanel::render() {
@@ -85,15 +85,15 @@ void TouchPanel::setTitle(const char* title) {
     drawTitle();
 }
 
-void TouchPanel::setStatus(const char* wifiLine, const char* btTelLine) {
+void TouchPanel::setStatus(const char* wifiLine, const char* telLine) {
     const char* w = wifiLine  ? wifiLine  : "";
-    const char* b = btTelLine ? btTelLine : "";
+    const char* b = telLine ? telLine : "";
     if (strncmp(w, wifiLine_,  sizeof(wifiLine_))  == 0
-     && strncmp(b, btTelLine_, sizeof(btTelLine_)) == 0) {
+     && strncmp(b, telLine_, sizeof(telLine_)) == 0) {
         return;
     }
     strncpy(wifiLine_,  w, sizeof(wifiLine_)  - 1); wifiLine_[sizeof(wifiLine_)   - 1] = 0;
-    strncpy(btTelLine_, b, sizeof(btTelLine_) - 1); btTelLine_[sizeof(btTelLine_) - 1] = 0;
+    strncpy(telLine_, b, sizeof(telLine_) - 1); telLine_[sizeof(telLine_) - 1] = 0;
     drawStatus();
 }
 

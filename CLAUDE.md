@@ -19,8 +19,9 @@ color flags are tuned for the new board (ST7789 + rotation=3 + BGR).
 - ✅ M3 Z80 core (superzazu, MIT) + 64KB RAM (heap-allocated to keep `.bss` small)
 - ✅ M4 CP/M 2.2 boot via Altair iCOM 3712 disk image
 - ✅ M5 touch control panel + mount modal (rotation=3, ST7789, invert=false, rgb_order=true)
-- 🚧 M6 BLE HID keyboard (lazy bring-up; pending Logitech K380 keyboard arrival)
-- ✅ M7 WiFi STA + telnet (port 23). FTP scaffolded but disabled via `ENABLE_FTP=0`
+- ❌ M6 BLE HID keyboard — **REMOVED**, insufficient internal RAM (see "BT removed" gotcha below). Telnet is the keyboard input path.
+- ✅ M7 WiFi STA + telnet (port 23) + VT-100 Tier-1 escape parser on the LCD console. FTP scaffolded but disabled via `ENABLE_FTP=0`.
+- 🚧 M8 on-screen keyboard — planned, for keyboard-less local input now that BT is gone.
 
 ## Build/runtime gotchas (read before changing related code)
 
@@ -35,12 +36,20 @@ in `Z80CPU::begin`) so it doesn't sit in `.bss`. Without that, BT +
 WiFi + FTP overflowed `dram0_0_seg` by ~11 KB. If you grow .bss further,
 the Z80 RAM is the obvious thing to push to PSRAM (board-dependent).
 
-**BT classic memory** — `extern "C" bool btInUse() { return true; }` in
-`vZ80.ino` keeps Bluedroid memory reserved (otherwise `esp_bt_controller_init`
-returns INVALID_STATE later). After WiFi setup, we call
-`esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT)` to free ~30 KB
-heap that WiFi needs to associate. The BLE memory remains reserved for
-M6.
+**BT removed (BT and WiFi cannot coexist on this board)** — Attempted M6
+BLE HID keyboard support, hit a hard wall: the original ESP32 in the
+CYD2USB has too little internal DRAM. With WiFi associated we have
+~17 KB free heap, largest contiguous block ~16 KB. `esp_bluedroid_init()`
+needs >15 KB contiguous for one of its internal allocations, returns
+NULL, and crashes (LoadProhibited) on the next deref. Tearing WiFi down
+at runtime frees ~34 KB of free heap *but the largest contiguous block
+doesn't budge* — the heap stays fragmented, so Bluedroid still can't
+init. PSRAM would solve it (move the 64 KB Z80 RAM out of internal DRAM)
+but a runtime probe at boot shows this board has no PSRAM chip
+(`quad_psram: PSRAM ID read error`). Net: no BT possible here. All BT
+code, the `btInUse()` weak-override, the Classic memory release, the
+PSRAM probe, and the BT button are gone. Keyboard input is now telnet
+over WiFi only. M8 will add an on-screen keyboard for keyboard-less use.
 
 **SimpleFTPServer storage type** — its default is `STORAGE_FFAT`, not
 `STORAGE_SD`. Per-project `#define`s in `src/network/ftp_server.cpp`
@@ -72,19 +81,18 @@ post-load values for anything that affects connectivity.
 
 ## Core/task pinning
 - loop + Z80 + FTP (when `ENABLE_FTP=1`) → core 1
-- BT/WiFi/lwIP → core 0
+- WiFi/lwIP → core 0
 - Touch SPI on VSPI, display+SD on HSPI
 
 ## Key files
 - `vZ80.ino` — setup/loop, Z80 task, button dispatch, network bring-up
 - `ESP32_SPI_9341.h` — LovyanGFX panel/touch config (Panel_ST7789)
-- `src/display/console.{h,cpp}` — 80×24 back-buffer + 5×7 font
+- `src/display/console.{h,cpp}` — 80×24 back-buffer + 5×7 font + VT-100 Tier-1 escape parser (CUP, EL/ED, NEL, DECSC/DECRC)
 - `src/z80/z80_cpu.{h,cpp}` — wraps superzazu, heap-alloc'd RAM
 - `src/cpm/altair_bios.{h,cpp}` — iCOM 3712 PROM trap stubs (port 0xC0..0xC5)
 - `src/storage/disk_image.{h,cpp}` — .DSK / .HDD reader
 - `src/ui/touch_panel.{h,cpp}` — 6-button strip + 8px status footer
 - `src/ui/mount_modal.{h,cpp}` — disk-mount overlay
-- `src/input/bt_keyboard.{h,cpp}` — BLE HID host (M6 in progress)
 - `src/network/wifi_sta.{h,cpp}` — STA connect (synchronous, blocks setup)
 - `src/network/telnet_server.{h,cpp}` — TCP/23, IAC negotiation, txStream fan-out
 - `src/network/ftp_server.{h,cpp}` — SimpleFTPServer wrapper, behind ENABLE_FTP

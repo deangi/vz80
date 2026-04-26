@@ -43,18 +43,18 @@ void SetupModal::render() {
     lcd_->setTextDatum(top_left);
     lcd_->setTextSize(1);
 
-    // 2x2 button grid centered horizontally
+    // Top row: REBOOT + MOUNT. Bottom row: CLEAR centered.
     int gridW = kBtnW * 2 + kBtnPadX;
     int gx = (320 - gridW) / 2;
     int x0 = gx;
     int x1 = gx + kBtnW + kBtnPadX;
     int y0 = kBtnAreaY;
     int y1 = kBtnAreaY + kBtnH + kBtnPadY;
+    int xClear = (320 - kBtnW) / 2;
 
-    drawButton(x0, y0, kBtnW, kBtnH, "REBOOT", TFT_DARKGREEN, false);
-    drawButton(x1, y0, kBtnW, kBtnH, "MOUNT",  TFT_NAVY,      false);
-    drawButton(x0, y1, kBtnW, kBtnH, "CLEAR",  TFT_MAROON,    false);
-    drawButton(x1, y1, kBtnW, kBtnH, "BT",     TFT_PURPLE,    false);
+    drawButton(x0,     y0, kBtnW, kBtnH, "REBOOT", TFT_DARKGREEN, false);
+    drawButton(x1,     y0, kBtnW, kBtnH, "MOUNT",  TFT_NAVY,      false);
+    drawButton(xClear, y1, kBtnW, kBtnH, "CLEAR",  TFT_MAROON,    false);
 
     // Version line above BACK button (size-1 text, light grey).
     if (version_[0] || date_[0]) {
@@ -78,16 +78,16 @@ SetupModal::Result SetupModal::hitTest(int x, int y) const {
     int x1 = gx + kBtnW + kBtnPadX;
     int y0 = kBtnAreaY;
     int y1 = kBtnAreaY + kBtnH + kBtnPadY;
+    int xClear = (320 - kBtnW) / 2;
 
     auto inRect = [&](int rx, int ry, int rw, int rh) {
         return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
     };
 
-    if (inRect(x0, y0, kBtnW, kBtnH)) return Result::REBOOT;
-    if (inRect(x1, y0, kBtnW, kBtnH)) return Result::MOUNT;
-    if (inRect(x0, y1, kBtnW, kBtnH)) return Result::CLEAR;
-    if (inRect(x1, y1, kBtnW, kBtnH)) return Result::BT;
-    if (inRect(60, kBackY, 200, kBackH)) return Result::CANCEL;
+    if (inRect(x0,     y0, kBtnW, kBtnH)) return Result::REBOOT;
+    if (inRect(x1,     y0, kBtnW, kBtnH)) return Result::MOUNT;
+    if (inRect(xClear, y1, kBtnW, kBtnH)) return Result::CLEAR;
+    if (inRect(60, kBackY, 200, kBackH))  return Result::CANCEL;
     return Result::CONTINUE;
 }
 

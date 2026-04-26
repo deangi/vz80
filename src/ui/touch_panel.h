@@ -4,19 +4,21 @@
 // New top strip layout (replaces the 6-button strip):
 //   [SETUP]   <title>          [SCROLL]
 //             wifi: ...
-//             bt: ...  tel: ...
+//             tel: ...
 //
 // Strip height: STRIP_H (48 px). Side buttons are 48x48 squares; the
 // middle 224 px holds a centered title in the upper portion and a
 // 16 px tall, 30-column status area in the lower portion (two lines
 // of 6x8 size-1 text). Console area below the strip is unchanged
 // (rows 48..239, 24 lines of 8 px).
+// (BT was removed — see vZ80.ino top-of-file note on the internal-RAM
+// constraint that ruled out BT on this board.)
 
 class TouchPanel {
 public:
     enum class Action : uint8_t {
         NONE,
-        SETUP,    // open setup popup (REBOOT/MOUNT/CLEAR/BT)
+        SETUP,    // open setup popup (REBOOT/MOUNT/CLEAR)
         SCROLL,   // cycle console view position
     };
 
@@ -32,7 +34,7 @@ public:
 
     // Per-second status update from the main loop. Each string ≤ 30 chars.
     // Pass nullptr or "" to clear that line. Skips redraw when unchanged.
-    void setStatus(const char* wifiLine, const char* btTelLine);
+    void setStatus(const char* wifiLine, const char* telLine);
 
     // Repaint everything in the strip (call after modals close or on a
     // forced redraw).
@@ -60,7 +62,7 @@ private:
 
     char    title_[32]    = "";
     char    wifiLine_[40] = "";
-    char    btTelLine_[40]= "";
+    char    telLine_[40]= "";
 
     int  hitTest(int x, int y) const;
     void drawButton(int idx, bool pressed);

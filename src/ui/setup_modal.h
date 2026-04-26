@@ -2,11 +2,11 @@
 #include <LovyanGFX.hpp>
 
 // Full-screen popup brought up by the SETUP button on the top strip.
-// Four buttons in a 2x2 grid:
+// Three buttons (BT was removed — see vZ80.ino top-of-file note on the
+// internal-RAM constraint that ruled out BT on this board):
 //   [REBOOT]  [MOUNT]
-//   [CLEAR ]  [BT   ]
-// User taps one to pick an action, or swipes anywhere outside to cancel
-// (BACK button at the bottom).
+//        [CLEAR]
+// User taps one to pick an action, or taps BACK at the bottom to cancel.
 class SetupModal {
 public:
     enum class Result : uint8_t {
@@ -14,7 +14,6 @@ public:
         REBOOT,      // cold-boot CP/M
         MOUNT,       // open mount modal
         CLEAR,       // clear console
-        BT,          // start BT pairing
         CANCEL,      // back without action
     };
 

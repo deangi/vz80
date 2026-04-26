@@ -8,13 +8,17 @@
 // M2: 80x24 console (5x7 font, horizontal scroll viewport)             .
 // M3: Z80 emulator (superzazu/z80, MIT) + 64KB RAM + console I/O ports .
 // M4: CP/M 2.2 boot from Altair iCOM 3712 .DSK image.                  .
-// M5: Touch control panel (top 48 px) + mount modal.  (current)
-//     Buttons: RUN/STOP | BOOT | CLR | BT | MNT | SCRL
+// M5: Touch control panel (top 48 px) + mount modal.
 //     MNT opens a full-screen overlay; the Z80 task is suspended while
 //     the modal is up so BDOS can't catch a half-swapped disk.
+// M6: BT keyboard — REMOVED, insufficient internal RAM (BT + WiFi cannot
+//     coexist on this ESP32 board; no PSRAM). Keyboard input is now
+//     telnet-only (M7).
+// M7: WiFi STA + telnet (port 23) + VT-100 escape parsing on the LCD.
+// M8: on-screen keyboard (planned) — local keyboard input without BT.
 //
-// Serial -> Z80 rx bridge stays in place through M5 for testing; it is
-// removed in M6 when the Bluetooth keyboard takes over input.
+// Serial -> Z80 rx bridge stays in place as a debugging input path; the
+// production input path is telnet over WiFi.
 //
 // Required Arduino libraries:
 //   - LovyanGFX       (lovyan03)        V1.2.19+
@@ -26,7 +30,6 @@
 #include <SD.h>
 #include <FS.h>
 #include <ArduinoJson.h>
-#include <esp_bt.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/stream_buffer.h>
@@ -39,23 +42,26 @@
 #include "src/ui/touch_panel.h"
 #include "src/ui/mount_modal.h"
 #include "src/ui/setup_modal.h"
-#include "src/input/bt_keyboard.h"
 #include "src/network/wifi_sta.h"
 #include "src/network/telnet_server.h"
 #include "src/network/ftp_server.h"
 
-extern void BtKeyboardTick();  // defined in bt_keyboard.cpp
-
 // Build identification — bumped on user-visible changes. Shown in the
 // SETUP popup so the running build is obvious without checking serial.
-static const char VZ80_VERSION[]    = "1.2";
-static const char VZ80_BUILD_DATE[] = "2026-04-25";
+static const char VZ80_VERSION[]    = "1.3";
+static const char VZ80_BUILD_DATE[] = "2026-04-26";
 
-// Override Arduino-ESP32's weak btInUse() so initArduino() does NOT call
-// esp_bt_controller_mem_release(BTDM) before setup() runs. Must live in
-// the main .ino so the strong definition is in the sketch's own archive
-// and wins the link over the core's weak default.
-extern "C" bool btInUse() { return true; }
+// Bluetooth removed (was M6). The original ESP32 in the CYD2USB has too
+// little internal DRAM to host both WiFi and Bluedroid simultaneously:
+// WiFi alone leaves ~17 KB free heap with the largest contiguous block
+// at ~16 KB, while esp_bluedroid_init() needs >15 KB contiguous and
+// crashes (LoadProhibited) when its internal alloc returns NULL. Even
+// tearing WiFi down at runtime doesn't help — the freed heap stays
+// fragmented. There's no PSRAM on this board (we probed at boot and the
+// QPI handshake fails), so Z80 RAM can't be moved off internal DRAM
+// either. Net: BT and WiFi cannot coexist here. Keyboard input now
+// comes from telnet over WiFi (src/network/telnet_server.{h,cpp}).
+// Future M8: on-screen keyboard for keyboard-less use.
 
 // -----------------------------------------------------------------------------
 // Pin assignments (display pins live in ESP32_SPI_9341.h)
@@ -259,7 +265,7 @@ static void doBoot() {
     console.clear();
     console.render();
     coldBootCpm();
-    // drain any stale serial/BT input so old keystrokes don't hit the BIOS
+    // drain any stale serial/telnet input so old keystrokes don't hit the BIOS
     xStreamBufferReset(rxStream);
     xStreamBufferReset(txStream);
     z80Resume();
@@ -269,22 +275,6 @@ static void doScroll() {
     touchPanel.advanceScroll();
     console.setView(TouchPanel::scrollColFor(touchPanel.scrollIndex()));
     console.markAllDirty();
-}
-
-static void doBtPair() {
-    using S = BtKeyboard::State;
-    S st = gBtKbd.state();
-    if (st == S::Off)        { console.puts("[BT] stack not up\n"); console.render(); return; }
-    if (st == S::Connected)  { console.puts("[BT] already connected\n"); console.render(); return; }
-    if (st == S::Pairing)    { console.puts("[BT] already pairing\n"); console.render(); return; }
-    console.puts("[BT] pairing 20s - make kbd discoverable\n");
-    console.render();
-    Serial.println("[BT] suspending Z80 for BT bringup");
-    Serial.flush();
-    bool wasRunning = z80Running;
-    if (wasRunning) z80Suspend();
-    gBtKbd.startPairing();
-    if (wasRunning) z80Resume();
 }
 
 static void handleMount() {
@@ -342,10 +332,6 @@ static void handleSetup() {
         console.clear();
         console.render();
         break;
-    case SetupModal::Result::BT:
-        z80Resume();
-        doBtPair();
-        return;
     case SetupModal::Result::CANCEL:
     default:
         break;
@@ -354,8 +340,10 @@ static void handleSetup() {
 }
 
 // -----------------------------------------------------------------------------
-// Serial -> Z80 rx bridge (temporary; removed in M6 when BT keyboard lands).
-// Arduino Serial Monitor "Newline" sends LF; CP/M wants CR, so remap.
+// Serial -> Z80 rx bridge. Useful for debugging via the USB serial port;
+// the production input path is telnet over WiFi (BT input was removed —
+// see top-of-file note). Arduino Serial Monitor "Newline" sends LF; CP/M
+// wants CR, so remap.
 // -----------------------------------------------------------------------------
 static void drainSerialToZ80() {
     while (Serial.available() > 0) {
@@ -433,24 +421,6 @@ void setup() {
     touchPanel.setTitle(cfgAppName);
     setupModal.setVersion(VZ80_VERSION, VZ80_BUILD_DATE);
 
-    // BT keyboard: "begin" only records the rx stream and flags ready.
-    // The actual Bluedroid/HID stack isn't brought up until the user taps
-    // BT (startPairing). This keeps boot stable regardless of BT state.
-    gBtKbd.begin(rxStream);
-    console.puts("[BT] tap BT button to pair a keyboard\n");
-    console.render();
-
-    // Release Bluedroid Classic BT heap NOW (we only ever use BLE for HID).
-    // Arduino's btInUse()=true override skips the boot-time release, and
-    // bringStackUp() doesn't run until the user presses BT — by then WiFi
-    // has already failed because ~30 KB of heap is locked away. Releasing
-    // before WiFi.begin() gives WiFi the headroom it needs to associate.
-    {
-        esp_err_t e = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
-        Serial.printf("[bt] classic mem release -> 0x%x  free=%u\n",
-            (unsigned)e, (unsigned)ESP.getFreeHeap());
-    }
-
     // M7: WiFi + telnet + FTP. Empty SSID disables the lot. Both telnet
     // listener and FTP server are started in loop() once STA_GOT_IP fires
     // (WiFiServer.begin() asserts inside lwIP if WiFi isn't initialized,
@@ -464,8 +434,7 @@ void setup() {
     }
 
     // Pin Z80 to core 1 (shares with Arduino loop/UI) and reserve core 0
-    // for BT/WiFi. Bluedroid tasks require core 0 and behave badly when
-    // a CPU-bound task is hammering the same core during bring-up.
+    // for WiFi/lwIP. (BT removed — see top-of-file note.)
     BaseType_t ok = xTaskCreatePinnedToCore(
         z80Task, "z80", 8192, &cpu, 1, &z80TaskHandle, 1);
     if (ok != pdPASS) fatal("Z80 TASK");
@@ -473,13 +442,12 @@ void setup() {
 
     Serial.printf("[heap] post-setup free=%u  largest=%u\n",
         (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
-    Serial.println("core0=BT reserved  core1=Z80+UI/display");
+    Serial.println("core0=WiFi/lwIP  core1=Z80+UI/display");
 }
 
 // -----------------------------------------------------------------------------
 void loop() {
     pollBootButton();
-    BtKeyboardTick();
     drainSerialToZ80();
 
     // Deferred network bring-up/tear-down (flagged by WiFi event task).
@@ -531,23 +499,14 @@ void loop() {
                      WifiSta::localIP().toString().c_str());
         }
 
-        // Line 2: BT keyboard + telnet client
-        const char* btTxt;
-        switch (gBtKbd.state()) {
-        case BtKeyboard::State::Off:        btTxt = "bt:off";       break;
-        case BtKeyboard::State::Idle:       btTxt = "bt:.";         break;
-        case BtKeyboard::State::Pairing:    btTxt = "bt:pair";      break;
-        case BtKeyboard::State::Connecting: btTxt = "bt:conn..";    break;
-        case BtKeyboard::State::Connected:  btTxt = "bt:kbd";       break;
-        default:                            btTxt = "bt:?";         break;
-        }
+        // Line 2: telnet client (BT removed — see top-of-file note).
         if (!cfgTelnetEnabled) {
-            snprintf(bline, sizeof(bline), "%s  tel:off", btTxt);
+            snprintf(bline, sizeof(bline), "tel:off");
         } else if (gTelnet.clientConnected()) {
-            snprintf(bline, sizeof(bline), "%s  tel:%s", btTxt,
+            snprintf(bline, sizeof(bline), "tel:%s",
                      gTelnet.clientIP().toString().c_str());
         } else {
-            snprintf(bline, sizeof(bline), "%s  tel:.", btTxt);
+            snprintf(bline, sizeof(bline), "tel:.");
         }
 
         touchPanel.setStatus(wline, bline);
