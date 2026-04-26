@@ -30,6 +30,15 @@ public:
     void setView(int col);
     int  view() const { return viewCol_; }
 
+    // Vertical row span — by default shows all 24 buffer rows in the
+    // 192 px console area. When the on-screen keyboard is open, the
+    // caller can shrink the visible span (e.g. setViewRowSpan(18, 6)
+    // shows just the last 6 rows in the top 48 px so the cursor stays
+    // visible while the keyboard occupies the bottom 144 px).
+    void setViewRowSpan(int topRow, int rowCount);
+    int  viewRowTop()   const { return viewRowTop_; }
+    int  viewRowCount() const { return viewRowsCount_; }
+
     // Colors apply to subsequent writes.
     void setColors(uint16_t fg, uint16_t bg) { fg_ = fg; bg_ = bg; }
 
@@ -50,7 +59,9 @@ private:
     bool dirty_[ROWS];
     int  cx_ = 0;
     int  cy_ = 0;
-    int  viewCol_ = 0;
+    int  viewCol_       = 0;
+    int  viewRowTop_    = 0;
+    int  viewRowsCount_ = ROWS;
     uint16_t fg_ = 0xFFFF;
     uint16_t bg_ = 0x0000;
 

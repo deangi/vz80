@@ -21,7 +21,7 @@ color flags are tuned for the new board (ST7789 + rotation=3 + BGR).
 - ✅ M5 touch control panel + mount modal (rotation=3, ST7789, invert=false, rgb_order=true)
 - ❌ M6 BLE HID keyboard — **REMOVED**, insufficient internal RAM (see "BT removed" gotcha below). Telnet is the keyboard input path.
 - ✅ M7 WiFi STA + telnet (port 23) + VT-100 Tier-1 escape parser on the LCD console. FTP scaffolded but disabled via `ENABLE_FTP=0`.
-- 🚧 M8 on-screen keyboard — planned, for keyboard-less local input now that BT is gone.
+- ✅ M8 on-screen US-QWERTY keyboard — modal overlay (bottom 144 px). Tap KBD on the top strip to toggle. Sticky one-shot SHIFT and CTRL (tap modifier → next key applies it, then auto-releases). Console viewport shrinks to the last 6 rows while the keyboard is up so the cursor stays visible. Built on `LGFX_Button`-style per-key drawing in `src/ui/keyboard_modal.{h,cpp}`.
 
 ## Build/runtime gotchas (read before changing related code)
 
@@ -93,6 +93,8 @@ post-load values for anything that affects connectivity.
 - `src/storage/disk_image.{h,cpp}` — .DSK / .HDD reader
 - `src/ui/touch_panel.{h,cpp}` — 6-button strip + 8px status footer
 - `src/ui/mount_modal.{h,cpp}` — disk-mount overlay
+- `src/ui/setup_modal.{h,cpp}` — REBOOT / MOUNT / CLEAR popup
+- `src/ui/keyboard_modal.{h,cpp}` — M8 on-screen QWERTY keyboard
 - `src/network/wifi_sta.{h,cpp}` — STA connect (synchronous, blocks setup)
 - `src/network/telnet_server.{h,cpp}` — TCP/23, IAC negotiation, txStream fan-out
 - `src/network/ftp_server.{h,cpp}` — SimpleFTPServer wrapper, behind ENABLE_FTP

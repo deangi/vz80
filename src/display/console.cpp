@@ -256,6 +256,16 @@ void Console::setView(int col) {
     markAllDirty();
 }
 
+void Console::setViewRowSpan(int topRow, int rowCount) {
+    if (topRow < 0) topRow = 0;
+    if (rowCount < 1) rowCount = 1;
+    if (topRow + rowCount > ROWS) rowCount = ROWS - topRow;
+    if (topRow == viewRowTop_ && rowCount == viewRowsCount_) return;
+    viewRowTop_    = topRow;
+    viewRowsCount_ = rowCount;
+    markAllDirty();
+}
+
 void Console::drawGlyphIntoSprite(int sx, char c) {
     const uint8_t* g = font5x7_glyph(c);
     for (int col = 0; col < 5; ++col) {
@@ -270,6 +280,9 @@ void Console::drawGlyphIntoSprite(int sx, char c) {
 }
 
 void Console::renderLine(int row) {
+    // Skip rows outside the active vertical viewport (used when the
+    // on-screen keyboard is open and only the last few rows are visible).
+    if (row < viewRowTop_ || row >= viewRowTop_ + viewRowsCount_) return;
     lineSpr_.fillScreen(bg_);
     int first = viewCol_;
     int last  = viewCol_ + VIEW_COLS;
@@ -279,7 +292,8 @@ void Console::renderLine(int row) {
         int sx = (col - first) * CELL_W;
         drawGlyphIntoSprite(sx, c);
     }
-    lineSpr_.pushSprite(lcd_, 0, Y_ORIGIN + row * CELL_H);
+    int dispRow = row - viewRowTop_;
+    lineSpr_.pushSprite(lcd_, 0, Y_ORIGIN + dispRow * CELL_H);
 }
 
 void Console::render() {

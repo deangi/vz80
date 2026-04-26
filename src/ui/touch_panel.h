@@ -1,16 +1,16 @@
 #pragma once
 #include <LovyanGFX.hpp>
 
-// New top strip layout (replaces the 6-button strip):
-//   [SETUP]   <title>          [SCROLL]
-//             wifi: ...
-//             tel: ...
+// Top strip layout:
+//   [SETUP] [KBD]   <title>       [SCROLL]
+//                   wifi: ...
+//                   tel: ...
 //
-// Strip height: STRIP_H (48 px). Side buttons are 48x48 squares; the
-// middle 224 px holds a centered title in the upper portion and a
-// 16 px tall, 30-column status area in the lower portion (two lines
-// of 6x8 size-1 text). Console area below the strip is unchanged
-// (rows 48..239, 24 lines of 8 px).
+// Strip height: STRIP_H (48 px). Three 48x48 buttons (SETUP + KBD on the
+// left, SCROLL on the right); the middle 176 px holds a centered title
+// in the upper portion and a 16 px tall, 22-column status area in the
+// lower portion (two lines of 6x8 size-1 text). Console area below the
+// strip is unchanged (rows 48..239, 24 lines of 8 px).
 // (BT was removed — see vZ80.ino top-of-file note on the internal-RAM
 // constraint that ruled out BT on this board.)
 
@@ -19,12 +19,13 @@ public:
     enum class Action : uint8_t {
         NONE,
         SETUP,    // open setup popup (REBOOT/MOUNT/CLEAR)
+        KBD,      // toggle on-screen keyboard modal (M8)
         SCROLL,   // cycle console view position
     };
 
     static constexpr int STRIP_H    = 48;
-    static constexpr int BTN_W      = 48;     // setup/scroll buttons are square
-    static constexpr int N_BUTTONS  = 2;
+    static constexpr int BTN_W      = 48;     // all three buttons are square
+    static constexpr int N_BUTTONS  = 3;
 
     bool begin(lgfx::LGFX_Device* lcd);
 
@@ -71,9 +72,10 @@ private:
 
     // Geometry helpers (constexpr-style for clarity).
     static constexpr int kSetupX  = 0;
-    static constexpr int kScrollX = 320 - BTN_W;
-    static constexpr int kMidX    = BTN_W;        // 48
-    static constexpr int kMidW    = 320 - 2 * BTN_W;  // 224
+    static constexpr int kKbdX    = BTN_W;        // 48
+    static constexpr int kScrollX = 320 - BTN_W;  // 272
+    static constexpr int kMidX    = 2 * BTN_W;    // 96
+    static constexpr int kMidW    = 320 - 3 * BTN_W;  // 176
     static constexpr int kTitleY  = 4;            // size-2 title sits y=4..19
     static constexpr int kStatY   = 24;           // 2 lines @ 8 px each = y=24..39
 };

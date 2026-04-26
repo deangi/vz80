@@ -15,7 +15,8 @@
 //     coexist on this ESP32 board; no PSRAM). Keyboard input is now
 //     telnet-only (M7).
 // M7: WiFi STA + telnet (port 23) + VT-100 escape parsing on the LCD.
-// M8: on-screen keyboard (planned) — local keyboard input without BT.
+// M8: on-screen US-QWERTY keyboard (modal overlay, sticky SHFT/CTRL).
+//     Tap KBD on the top strip to toggle.
 //
 // Serial -> Z80 rx bridge stays in place as a debugging input path; the
 // production input path is telnet over WiFi.
@@ -42,13 +43,15 @@
 #include "src/ui/touch_panel.h"
 #include "src/ui/mount_modal.h"
 #include "src/ui/setup_modal.h"
+#include "src/ui/keyboard_modal.h"
+#include "src/hw/RgbLed.h"
 #include "src/network/wifi_sta.h"
 #include "src/network/telnet_server.h"
 #include "src/network/ftp_server.h"
 
 // Build identification — bumped on user-visible changes. Shown in the
 // SETUP popup so the running build is obvious without checking serial.
-static const char VZ80_VERSION[]    = "1.3";
+static const char VZ80_VERSION[]    = "1.5";
 static const char VZ80_BUILD_DATE[] = "2026-04-26";
 
 // Bluetooth removed (was M6). The original ESP32 in the CYD2USB has too
@@ -71,6 +74,14 @@ static const uint8_t SD_SCK_PIN  = 18;
 static const uint8_t SD_MISO_PIN = 19;
 static const uint8_t SD_MOSI_PIN = 23;
 
+// On-board RGB LED — common-anode (active LOW). Pin numbers are the
+// CYD/CYD2USB defaults; verify against your board if the LED behaves
+// unexpectedly.
+static const int RGB_R_PIN     = 4;
+static const int RGB_G_PIN     = 16;
+static const int RGB_B_PIN     = 17;
+static const int RGB_ACTIVE_LOW = 1;   // 1 = LOW turns the LED on
+
 // -----------------------------------------------------------------------------
 // Globals
 // -----------------------------------------------------------------------------
@@ -83,9 +94,12 @@ static Console     console;
 static Z80CPU      cpu;
 static AltairBios  bios;
 static DiskImage   disks[4];   // A, B, C, D
-static TouchPanel  touchPanel;
-static MountModal  mountModal;
-static SetupModal  setupModal;
+static TouchPanel    touchPanel;
+static MountModal    mountModal;
+static SetupModal    setupModal;
+static KeyboardModal kbdModal;
+static bool          kbdOpen = false;
+static RgbLed        rgbLed(RGB_R_PIN, RGB_G_PIN, RGB_B_PIN, RGB_ACTIVE_LOW);
 
 static StreamBufferHandle_t txStream = nullptr;  // Z80 -> display
 static StreamBufferHandle_t rxStream = nullptr;  // keyboard -> Z80
@@ -275,6 +289,29 @@ static void doScroll() {
     touchPanel.advanceScroll();
     console.setView(TouchPanel::scrollColFor(touchPanel.scrollIndex()));
     console.markAllDirty();
+}
+
+// Toggle the on-screen keyboard. When open, the console viewport shrinks
+// to the last 6 buffer rows (so the cursor stays visible above the
+// keyboard); when closed, it restores to full 24 rows.
+static void doKbdToggle() {
+    if (kbdOpen) {
+        kbdModal.close();
+        kbdOpen = false;
+        console.setViewRowSpan(0, Console::ROWS);
+        // Wipe the keyboard area; renderer will repaint console rows over it.
+        lcd.fillRect(0, KeyboardModal::KBD_Y0, 320, KeyboardModal::KBD_H, TFT_BLACK);
+        console.render();
+    } else {
+        console.setViewRowSpan(Console::ROWS - 6, 6);
+        // Wipe the now-hidden console rows below the visible 6-row strip
+        // so stale glyphs don't bleed through edges of the keyboard area.
+        lcd.fillRect(0, Console::Y_ORIGIN + 6 * Console::CELL_H,
+                     320, KeyboardModal::KBD_Y0 - (Console::Y_ORIGIN + 6 * Console::CELL_H),
+                     TFT_BLACK);
+        kbdModal.open(&lcd);
+        kbdOpen = true;
+    }
 }
 
 static void handleMount() {
@@ -487,7 +524,29 @@ void loop() {
 
     gTelnet.tick();
 
-    // Refresh top-strip status (wifi line + bt/telnet line) once a second.
+    // RGB LED: off when WiFi disconnected; steady green when WiFi up;
+    // 2 Hz green blink when a telnet client is also connected. Bit
+    // layout per RgbLed::Set: bit2=R, bit1=G, bit0=B (the RGBCOLOR_*
+    // macros in the driver header are labeled wrong, so we use raw
+    // values — green = 0b010).
+    static uint32_t nextLed_ms = 0;
+    static bool     ledBlinkOn = false;
+    if ((int32_t)(millis() - nextLed_ms) >= 0) {
+        nextLed_ms = millis() + 250;          // 4 Hz tick = 2 Hz blink
+        bool wifiUp = WifiSta::connected();
+        bool telUp  = gTelnet.clientConnected();
+        if (!wifiUp) {
+            rgbLed.Set(0);                    // off
+        } else if (telUp) {
+            ledBlinkOn = !ledBlinkOn;
+            rgbLed.Set(ledBlinkOn ? 0b010 : 0);  // green / off
+        } else {
+            rgbLed.Set(0b010);                // steady green
+            ledBlinkOn = false;
+        }
+    }
+
+    // Refresh top-strip status (wifi line + telnet line) once a second.
     static uint32_t nextNetStatus_ms = 0;
     if ((int32_t)(millis() - nextNetStatus_ms) >= 0) {
         nextNetStatus_ms = millis() + 1000;
@@ -531,9 +590,19 @@ void loop() {
 
     // Touch panel actions.
     switch (touchPanel.poll()) {
-        case TouchPanel::Action::SETUP:  handleSetup(); break;
-        case TouchPanel::Action::SCROLL: doScroll();    break;
+        case TouchPanel::Action::SETUP:  handleSetup();   break;
+        case TouchPanel::Action::KBD:    doKbdToggle();   break;
+        case TouchPanel::Action::SCROLL: doScroll();      break;
         case TouchPanel::Action::NONE:   break;
+    }
+
+    // On-screen keyboard input (when open). Each tap sends one byte
+    // into the same rxStream that telnet/serial use.
+    if (kbdOpen) {
+        if (kbdModal.poll() == KeyboardModal::Result::KEY) {
+            uint8_t b = kbdModal.lastByte();
+            xStreamBufferSend(rxStream, &b, 1, 0);
+        }
     }
 
     delay(10);

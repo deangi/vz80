@@ -4,7 +4,7 @@
 #include <FS.h>
 #include <string.h>
 
-static const char* kLabels[TouchPanel::N_BUTTONS] = { "SET", "SCR" };
+static const char* kLabels[TouchPanel::N_BUTTONS] = { "SET", "KBD", "SCR" };
 
 uint16_t TouchPanel::scrollColFor(uint8_t idx) {
     static const uint16_t kCols[4] = { 0, 9, 18, 27 };
@@ -20,7 +20,13 @@ bool TouchPanel::begin(lgfx::LGFX_Device* lcd) {
 
 void TouchPanel::drawButton(int idx, bool pressed) {
     if (!lcd_ || idx < 0 || idx >= N_BUTTONS) return;
-    int x = (idx == 0) ? kSetupX : kScrollX;
+    int x;
+    switch (idx) {
+        case 0:  x = kSetupX;  break;
+        case 1:  x = kKbdX;    break;
+        case 2:  x = kScrollX; break;
+        default: return;
+    }
     int w = BTN_W;
 
     uint16_t bg = pressed ? TFT_ORANGE : 0x2104;  // dark slate
@@ -100,7 +106,8 @@ void TouchPanel::setStatus(const char* wifiLine, const char* telLine) {
 int TouchPanel::hitTest(int x, int y) const {
     if (y < 0 || y >= STRIP_H) return -1;
     if (x >= kSetupX  && x < kSetupX  + BTN_W) return 0;  // SETUP
-    if (x >= kScrollX && x < kScrollX + BTN_W) return 1;  // SCROLL
+    if (x >= kKbdX    && x < kKbdX    + BTN_W) return 1;  // KBD
+    if (x >= kScrollX && x < kScrollX + BTN_W) return 2;  // SCROLL
     return -1;
 }
 
@@ -119,7 +126,8 @@ TouchPanel::Action TouchPanel::poll() {
             renderButton(idx);
             switch (idx) {
                 case 0: act = Action::SETUP;  break;
-                case 1: act = Action::SCROLL; break;
+                case 1: act = Action::KBD;    break;
+                case 2: act = Action::SCROLL; break;
             }
         }
     }
