@@ -70,7 +70,14 @@ void TelnetServer::doNegotiation() {
 
 void TelnetServer::readFromClient() {
     auto* c = static_cast<WiFiClient*>(client_);
-    while (c->available()) {
+    // Stop draining TCP when rxStream is nearly full. The unread bytes
+    // stay in lwIP's receive buffer; once that fills, TCP advertises a
+    // smaller window and the sender slows down. Without this, big telnet
+    // pastes would silently drop at xStreamBufferSend (timeout=0).
+    // Margin of 4 covers IAC sequences that consume >1 TCP byte per
+    // produced rxStream byte.
+    while (c->available() &&
+           (!rx_ || xStreamBufferSpacesAvailable(rx_) >= 4)) {
         uint8_t b = (uint8_t)c->read();
         switch (iacState_) {
         case IacState::Data:

@@ -407,8 +407,13 @@ void setup() {
     console.puts("vZ80 M5 - booting CP/M ...\n");
     console.render();
 
-    txStream = xStreamBufferCreate(256, 1);
-    rxStream = xStreamBufferCreate(256, 1);
+    // Stream sizes: rxStream is large enough to absorb a multi-KB telnet
+    // paste without dropping bytes (telnet stops draining TCP when rxStream
+    // is near-full so TCP-window backpressure throttles the sender).
+    // txStream is sized for typical Z80 bursts; the SIO status port reports
+    // "tx busy" when it fills, so the Z80 busy-waits instead of losing bytes.
+    txStream = xStreamBufferCreate(1024, 1);
+    rxStream = xStreamBufferCreate(4096, 1);
     if (!txStream || !rxStream) fatal("STREAMS");
 
     cpu.begin(txStream, rxStream);

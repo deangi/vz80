@@ -71,12 +71,17 @@ uint8_t Z80CPU::s_in(z80* z, uint8_t port) {
     auto* self = static_cast<Z80CPU*>(z->userdata);
     bool rxReady = self->rxIn_ &&
                    xStreamBufferBytesAvailable(self->rxIn_) > 0;
+    // tx ready only when txOut_ has room — otherwise the Z80 polls until
+    // the display task drains a byte. Without this, BDOS CONOUT would
+    // silently drop bytes (xStreamBufferSend timeout=0) on bursts.
+    bool txReady = self->txOut_ &&
+                   xStreamBufferSpacesAvailable(self->txOut_) > 0;
 
     switch (port) {
         // 88-SIO status: bits inverted. All 1s = idle. Clear bit when ready.
         case PORT_SIO_STATUS: {
             uint8_t s = 0xFF;
-            s &= ~0x80;                   // tx always ready -> bit 7 = 0
+            if (txReady) s &= ~0x80;      // tx ready -> bit 7 = 0
             if (rxReady) s &= ~0x01;      // rx ready -> bit 0 = 0
             return s;
         }
@@ -88,7 +93,8 @@ uint8_t Z80CPU::s_in(z80* z, uint8_t port) {
 
         // 88-2SIO status: non-inverted. 0 = idle. Set bit when ready.
         case PORT_2SIO_STATUS: {
-            uint8_t s = 0x02;             // tx always ready -> bit 1 = 1
+            uint8_t s = 0;
+            if (txReady) s |= 0x02;       // tx ready -> bit 1 = 1
             if (rxReady) s |= 0x01;       // rx ready -> bit 0 = 1
             return s;
         }
