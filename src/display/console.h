@@ -54,9 +54,29 @@ private:
     uint16_t fg_ = 0xFFFF;
     uint16_t bg_ = 0x0000;
 
+    enum ParseState : uint8_t { PS_GROUND, PS_ESC, PS_CSI };
+    static constexpr int MAX_PARAMS = 2;
+    ParseState pstate_ = PS_GROUND;
+    int   params_[MAX_PARAMS]    = {0, 0};
+    bool  paramSeen_[MAX_PARAMS] = {false, false};
+    int   paramCount_   = 0;
+    int   csiParamIdx_  = 0;
+    bool  csiIgnore_    = false;
+    int   savedCx_      = 0;
+    int   savedCy_      = 0;
+
     void scrollUp();
     void newline();
     void writeCell(int row, int col, char c);
     void renderLine(int row);
     void drawGlyphIntoSprite(int sx, char c);
+
+    void putcGround(uint8_t c);
+    void parseEsc(uint8_t c);
+    void parseCsi(uint8_t c);
+    void dispatchCsi(uint8_t finalByte);
+    int  csiParam(int i, int defaultVal) const;
+    void cursorTo(int row, int col);
+    void eraseInLine(int mode);
+    void eraseInDisplay(int mode);
 };
