@@ -16,12 +16,21 @@ public:
     static constexpr int Y_ORIGIN   = 48;   // top of console area
     static constexpr int TAB_STOP   = 8;
 
+    // Terminal personality. Selects how the conflicting C0 codes 0x0B/0x0C/0x1A
+    // and ESC E are interpreted. Non-conflicting codes from both families
+    // (ESC =, ESC T, ESC Y, 0x1E for ADM-3A; CSI sequences for VT-100) are
+    // accepted in either mode.
+    enum TermMode : uint8_t { TM_VT100 = 0, TM_ADM3A = 1 };
+
     bool begin(lgfx::LGFX_Device* lcd, uint16_t fg = 0xFFFF, uint16_t bg = 0x0000);
     void clear();                           // FF: clear + home
     void putc(char c);
     void puts(const char* s);
     void print(const char* s) { puts(s); }
     void println(const char* s) { puts(s); putc('\n'); }
+
+    void setTerminalMode(TermMode m) { mode_ = m; }
+    TermMode terminalMode() const { return mode_; }
 
     // Viewport (horizontal pan).
     void viewLeft(int cols = 8);            // pan view toward col 0
@@ -65,7 +74,11 @@ private:
     uint16_t fg_ = 0xFFFF;
     uint16_t bg_ = 0x0000;
 
-    enum ParseState : uint8_t { PS_GROUND, PS_ESC, PS_CSI };
+    enum ParseState : uint8_t {
+        PS_GROUND, PS_ESC, PS_CSI,
+        PS_ADM_CUP_ROW,   // saw ESC '='; next byte = row + 0x20
+        PS_ADM_CUP_COL    // saw row byte; next byte = col + 0x20
+    };
     static constexpr int MAX_PARAMS = 2;
     ParseState pstate_ = PS_GROUND;
     int   params_[MAX_PARAMS]    = {0, 0};
@@ -75,6 +88,8 @@ private:
     bool  csiIgnore_    = false;
     int   savedCx_      = 0;
     int   savedCy_      = 0;
+    int   admCupRow_    = 0;
+    TermMode mode_      = TM_VT100;
 
     void scrollUp();
     void newline();
@@ -85,6 +100,8 @@ private:
     void putcGround(uint8_t c);
     void parseEsc(uint8_t c);
     void parseCsi(uint8_t c);
+    void parseAdmCupRow(uint8_t c);
+    void parseAdmCupCol(uint8_t c);
     void dispatchCsi(uint8_t finalByte);
     int  csiParam(int i, int defaultVal) const;
     void cursorTo(int row, int col);

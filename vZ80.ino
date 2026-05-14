@@ -118,6 +118,7 @@ static char cfgFtpPass[33]  = "cpm";
 static bool cfgFtpEnabled = true;
 static bool cfgTelnetEnabled = true;
 static uint16_t cfgTelnetPort = 23;
+static char cfgTerminal[8] = "vt100";  // "vt100" or "adm3a"
 
 // -----------------------------------------------------------------------------
 // WiFi event hooks. These fire on the system event task (core 0) — keep
@@ -175,13 +176,24 @@ static bool loadConfig() {
     cfgTelnetEnabled = doc["telnet"]["enabled"] | true;
     cfgTelnetPort    = doc["telnet"]["port"]    | 23;
     copyCfgStr(cfgAppName, sizeof(cfgAppName),  doc["app"]["name"] | "vZ80");
+    copyCfgStr(cfgTerminal, sizeof(cfgTerminal),
+               doc["display"]["terminal"] | "vt100");
+
+    // Apply terminal personality immediately — console is already begun.
+    // Unrecognized values fall back to VT-100 (the default).
+    if (strcasecmp(cfgTerminal, "adm3a") == 0) {
+        console.setTerminalMode(Console::TM_ADM3A);
+    } else {
+        console.setTerminalMode(Console::TM_VT100);
+    }
 
     Serial.printf("cfg A:=%s B:=%s C:=%s D:=%s\n",
                   cfgDrives[0], cfgDrives[1], cfgDrives[2], cfgDrives[3]);
-    Serial.printf("cfg wifi=%s ftp=%s telnet=%s:%u\n",
+    Serial.printf("cfg wifi=%s ftp=%s telnet=%s:%u term=%s\n",
                   cfgWifiSsid[0] ? cfgWifiSsid : "(off)",
                   cfgFtpUser,
-                  cfgTelnetEnabled ? "on" : "off", cfgTelnetPort);
+                  cfgTelnetEnabled ? "on" : "off", cfgTelnetPort,
+                  cfgTerminal);
     return true;
 }
 

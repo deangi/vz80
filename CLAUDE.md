@@ -71,7 +71,7 @@ JSON keys use full English words, snake_case for compounds:
   "telnet": { "enabled": true, "port": 23 },
   "drives": { "A": "altair48k.dsk", "B": "floppy1.dsk", "C": "...", "D": "" },
   "bluetooth": { "keyboard_name": "", "keyboard_mac": "" },
-  "display":   { "brightness": 100, "scroll_anchor": "left" },
+  "display":   { "brightness": 100, "scroll_anchor": "left", "terminal": "vt100" },
   "app":       { "name": "vZ80", "version": "1.0.0" }
 }
 ```
@@ -87,7 +87,7 @@ post-load values for anything that affects connectivity.
 ## Key files
 - `vZ80.ino` — setup/loop, Z80 task, button dispatch, network bring-up
 - `ESP32_SPI_9341.h` — LovyanGFX panel/touch config (Panel_ST7789)
-- `src/display/console.{h,cpp}` — 80×24 back-buffer + 5×7 font + VT-100 Tier-1 escape parser (CUP, EL/ED, NEL, DECSC/DECRC)
+- `src/display/console.{h,cpp}` — 80×24 back-buffer + 5×7 font + escape parser. VT-100 Tier-1 (CUP, EL/ED, NEL, DECSC/DECRC) plus ADM-3A (ESC = r c, ESC T, ESC Y, ESC *, RS=home). Mode switch (`display.terminal` = `"vt100"`|`"adm3a"`) chooses how the conflicting C0 codes 0x0B/0x0C/0x1A behave; default is `vt100`.
 - `src/z80/z80_cpu.{h,cpp}` — wraps superzazu, heap-alloc'd RAM
 - `src/cpm/altair_bios.{h,cpp}` — iCOM 3712 PROM trap stubs (port 0xC0..0xC5)
 - `src/storage/disk_image.{h,cpp}` — .DSK / .HDD reader

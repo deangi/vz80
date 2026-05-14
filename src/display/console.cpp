@@ -60,12 +60,24 @@ void Console::putc(char c) {
         pstate_ = PS_ESC;
         return;
     }
-    // CAN (0x18) and SUB (0x1A) cancel any in-progress escape sequence.
-    if (b == 0x18 || b == 0x1A) {
+    // CAN (0x18) always cancels any in-progress escape sequence.
+    if (b == 0x18) {
         pstate_    = PS_GROUND;
         csiIgnore_ = false;
         return;
     }
+    // SUB (0x1A): VT-100 cancels in-progress escape; ADM-3A clears+homes.
+    // Either way, parser state returns to ground.
+    if (b == 0x1A) {
+        if (mode_ == TM_ADM3A) clear();
+        pstate_    = PS_GROUND;
+        csiIgnore_ = false;
+        return;
+    }
+    // ESC = takes two raw bytes as row/col — they must reach the parser
+    // unfiltered even when their value is < 0x20 (top-of-screen rows/cols).
+    if (pstate_ == PS_ADM_CUP_ROW) { parseAdmCupRow(b); return; }
+    if (pstate_ == PS_ADM_CUP_COL) { parseAdmCupCol(b); return; }
     // Other C0 controls (CR, LF, BS, TAB, FF) execute immediately even
     // mid-escape, without disturbing parser state. MBASIC's WIDTH auto-wrap
     // can inject CR/LF inside an escape sequence — without this, the rest of
@@ -75,15 +87,17 @@ void Console::putc(char c) {
         return;
     }
     switch (pstate_) {
-        case PS_GROUND: putcGround(b); return;
-        case PS_ESC:    parseEsc(b);   return;
-        case PS_CSI:    parseCsi(b);   return;
+        case PS_GROUND:      putcGround(b);     return;
+        case PS_ESC:         parseEsc(b);       return;
+        case PS_CSI:         parseCsi(b);       return;
+        case PS_ADM_CUP_ROW: parseAdmCupRow(b); return;
+        case PS_ADM_CUP_COL: parseAdmCupCol(b); return;
     }
 }
 
 void Console::putcGround(uint8_t c) {
     switch (c) {
-        case 0x08: // BS
+        case 0x08: // BS — cursor left (both modes)
             if (cx_ > 0) --cx_;
             return;
         case 0x09: // TAB
@@ -96,11 +110,23 @@ void Console::putcGround(uint8_t c) {
         case 0x0A: // LF
             newline();
             return;
-        case 0x0C: // FF
-            clear();
+        case 0x0B: // VT — ADM-3A cursor up; VT-100 ignores
+            if (mode_ == TM_ADM3A && cy_ > 0) --cy_;
+            return;
+        case 0x0C: // FF — VT-100 clear+home; ADM-3A cursor right
+            if (mode_ == TM_ADM3A) {
+                if (cx_ < COLS - 1) ++cx_;
+            } else {
+                clear();
+            }
             return;
         case 0x0D: // CR
             cx_ = 0;
+            return;
+        case 0x1E: // RS — home cursor (no clear). Useful for ADM-3A software
+                   // and harmless in VT-100 mode.
+            cx_ = 0;
+            cy_ = 0;
             return;
         default:
             break;
@@ -113,7 +139,7 @@ void Console::putcGround(uint8_t c) {
 
 void Console::parseEsc(uint8_t c) {
     switch (c) {
-        case '[':
+        case '[':  // CSI — VT-100; CSI handler stays active in both modes
             pstate_ = PS_CSI;
             paramCount_  = 0;
             csiParamIdx_ = 0;
@@ -121,7 +147,8 @@ void Console::parseEsc(uint8_t c) {
             params_[0] = params_[1] = 0;
             paramSeen_[0] = paramSeen_[1] = false;
             return;
-        case 'E':  // NEL — next line (CR + LF)
+        case 'E':  // VT-100 NEL (newline); ADM-3A would mean "insert line"
+                   // which we don't implement — keep NEL in both modes.
             newline();
             pstate_ = PS_GROUND;
             return;
@@ -137,10 +164,36 @@ void Console::parseEsc(uint8_t c) {
             if (cy_ < 0) cy_ = 0; else if (cy_ >= ROWS) cy_ = ROWS - 1;
             pstate_ = PS_GROUND;
             return;
+        case '=':  // ADM-3A cursor address: next two bytes = row+0x20, col+0x20
+            pstate_ = PS_ADM_CUP_ROW;
+            return;
+        case 'T':  // ADM-3A erase to end of line
+            eraseInLine(0);
+            pstate_ = PS_GROUND;
+            return;
+        case 'Y':  // ADM-3A erase to end of screen
+            eraseInDisplay(0);
+            pstate_ = PS_GROUND;
+            return;
+        case '*':  // ADM-3A clear screen + home (Kaypro/Lear-Siegler dialect)
+            clear();
+            pstate_ = PS_GROUND;
+            return;
         default:   // unknown — silently drop
             pstate_ = PS_GROUND;
             return;
     }
+}
+
+void Console::parseAdmCupRow(uint8_t c) {
+    admCupRow_ = (int)c - 0x20;
+    pstate_ = PS_ADM_CUP_COL;
+}
+
+void Console::parseAdmCupCol(uint8_t c) {
+    int col = (int)c - 0x20;
+    cursorTo(admCupRow_, col);   // cursorTo clamps to valid range
+    pstate_ = PS_GROUND;
 }
 
 void Console::parseCsi(uint8_t c) {
