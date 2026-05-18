@@ -29,19 +29,72 @@ void TouchPanel::drawButton(int idx, bool pressed) {
     }
     int w = BTN_W;
 
-    uint16_t bg = pressed ? TFT_ORANGE : 0x2104;  // dark slate
-    uint16_t fg = TFT_WHITE;
-    const char* label = kLabels[idx];
+    // Repaint the bar slice behind the button so the bevel edges sit on
+    // the green background, not the previous frame's bevel. Stops above
+    // the separator+buffer strip (last 4 px of STRIP_H).
+    lcd_->fillRect(x, 0, w, STRIP_H - 4, kBarBg);
 
-    lcd_->fillRect(x + 1, 1, w - 2, STRIP_H - 2, bg);
-    lcd_->drawRect(x, 0, w, STRIP_H, TFT_DARKGREY);
+    uint16_t face = pressed ? TFT_ORANGE : kBtnFace;
+    uint16_t fg   = TFT_WHITE;
 
-    lcd_->setTextDatum(middle_center);
-    lcd_->setTextColor(fg, bg);
-    lcd_->setTextSize(2);
-    lcd_->drawString(label, x + w / 2, STRIP_H / 2);
-    lcd_->setTextDatum(top_left);
-    lcd_->setTextSize(1);
+    // Button body: rounded rect, inset 2 px from edges. Bottom sits at
+    // y=41 to clear the separator (y=44..45) and 2-px black buffer (46..47).
+    const int bx = x + 2;
+    const int by = 2;
+    const int bw = w - 4;
+    const int bh = STRIP_H - 8;   // y=2..41
+    lcd_->fillRoundRect(bx, by, bw, bh, 4, face);
+
+    // Bevel: top/left highlight + bottom/right shadow. Inverted when pressed
+    // so the button reads as "pushed in".
+    uint16_t hi = pressed ? kBtnSh : kBtnHi;
+    uint16_t sh = pressed ? kBtnHi : kBtnSh;
+    lcd_->drawFastHLine(bx + 1, by,          bw - 2, hi);
+    lcd_->drawFastVLine(bx,     by + 1,      bh - 2, hi);
+    lcd_->drawFastHLine(bx + 1, by + bh - 1, bw - 2, sh);
+    lcd_->drawFastVLine(bx + bw - 1, by + 1, bh - 2, sh);
+
+    const int cx = x + w / 2;
+    const int cy = by + bh / 2;
+
+    switch (idx) {
+        case 1:  // KBD — keyboard pictogram
+            drawKeyboardIcon(cx, cy, fg);
+            break;
+        case 2:  // SCROLL — right-facing arrow
+            drawScrollArrow(cx, cy, fg);
+            break;
+        default: // SETUP — keep text label
+            lcd_->setTextDatum(middle_center);
+            lcd_->setTextColor(fg, face);
+            lcd_->setTextSize(2);
+            lcd_->drawString(kLabels[idx], cx, cy);
+            lcd_->setTextDatum(top_left);
+            lcd_->setTextSize(1);
+            break;
+    }
+}
+
+void TouchPanel::drawKeyboardIcon(int cx, int cy, uint16_t color) {
+    // ~28x16 mini keyboard centered on (cx, cy): rounded body, 2 rows of
+    // 6 key-dots, plus a spacebar across the bottom.
+    const int x = cx - 14;
+    const int y = cy - 8;
+    lcd_->drawRoundRect(x, y, 28, 16, 2, color);
+    for (int row = 0; row < 2; ++row) {
+        for (int col = 0; col < 6; ++col) {
+            lcd_->fillRect(x + 3 + col * 4, y + 3 + row * 4, 3, 2, color);
+        }
+    }
+    lcd_->fillRect(x + 6, y + 11, 16, 2, color);  // spacebar
+}
+
+void TouchPanel::drawScrollArrow(int cx, int cy, uint16_t color) {
+    // Right-pointing filled triangle, ~16w x 20h, centered on (cx, cy).
+    lcd_->fillTriangle(cx - 8, cy - 10,
+                       cx - 8, cy + 10,
+                       cx + 8, cy,
+                       color);
 }
 
 void TouchPanel::renderButton(int idx) {
@@ -52,10 +105,10 @@ void TouchPanel::drawTitle() {
     if (!lcd_) return;
     // Clear title row (y=0..15, size-2 text is 16 px tall starting at kTitleY=4
     // — clear y=0..23 to wipe any prior longer title).
-    lcd_->fillRect(kMidX, 0, kMidW, kStatY, TFT_BLACK);
+    lcd_->fillRect(kMidX, 0, kMidW, kStatY, kBarBg);
     if (!title_[0]) return;
     lcd_->setTextDatum(middle_center);
-    lcd_->setTextColor(TFT_CYAN, TFT_BLACK);
+    lcd_->setTextColor(TFT_WHITE, kBarBg);
     lcd_->setTextSize(2);
     lcd_->drawString(title_, kMidX + kMidW / 2, kTitleY + 8);
     lcd_->setTextDatum(top_left);
@@ -65,10 +118,10 @@ void TouchPanel::drawTitle() {
 void TouchPanel::drawStatus() {
     if (!lcd_) return;
     // Clear two-line status area (y=24..39, plus 1 px padding on each side)
-    lcd_->fillRect(kMidX, kStatY, kMidW, 16, TFT_BLACK);
+    lcd_->fillRect(kMidX, kStatY, kMidW, 16, kBarBg);
     lcd_->setTextSize(1);
     lcd_->setTextDatum(top_left);
-    lcd_->setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    lcd_->setTextColor(TFT_WHITE, kBarBg);
     lcd_->setCursor(kMidX + 2, kStatY);
     lcd_->print(wifiLine_);
     lcd_->setCursor(kMidX + 2, kStatY + 8);
@@ -77,10 +130,14 @@ void TouchPanel::drawStatus() {
 
 void TouchPanel::render() {
     if (!lcd_) return;
-    lcd_->fillRect(0, 0, 320, STRIP_H, TFT_BLACK);
+    lcd_->fillRect(0, 0, 320, STRIP_H, kBarBg);
     for (int i = 0; i < N_BUTTONS; ++i) renderButton(i);
     drawTitle();
     drawStatus();
+    // 2-px white separator + 2-px black buffer between the strip and the
+    // console area below (console Y_ORIGIN=48 unchanged).
+    lcd_->fillRect(0, STRIP_H - 4, 320, 2, TFT_WHITE);
+    lcd_->fillRect(0, STRIP_H - 2, 320, 2, TFT_BLACK);
 }
 
 void TouchPanel::setTitle(const char* title) {

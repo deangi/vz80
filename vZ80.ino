@@ -51,8 +51,8 @@
 
 // Build identification — bumped on user-visible changes. Shown in the
 // SETUP popup so the running build is obvious without checking serial.
-static const char VZ80_VERSION[]    = "1.5";
-static const char VZ80_BUILD_DATE[] = "2026-04-26";
+static const char VZ80_VERSION[]    = "1.6";
+static const char VZ80_BUILD_DATE[] = "2026-05-17";
 
 // Bluetooth removed (was M6). The original ESP32 in the CYD2USB has too
 // little internal DRAM to host both WiFi and Bluedroid simultaneously:
@@ -452,7 +452,7 @@ void setup() {
     if (!initSD()) fatal("NO SD");
     Serial.printf("SD %llu MB\n", SD.cardSize() / (1024ULL * 1024ULL));
 
-    if (!console.begin(&lcd, TFT_WHITE, TFT_BLACK)) fatal("CONSOLE");
+    if (!console.begin(&lcd, TFT_GREEN, TFT_BLACK)) fatal("CONSOLE");
     console.puts("vZ80 M5 - booting CP/M ...\n");
     console.render();
 
