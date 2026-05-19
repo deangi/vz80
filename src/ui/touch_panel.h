@@ -83,7 +83,7 @@ private:
 
     // Visual style — forest green bar, beveled buttons, white separator.
     static constexpr uint16_t kBarBg   = 0x0320;  // forest green (RGB565)
-    static constexpr uint16_t kBtnFace = 0x39E7;  // mid slate (unpressed)
+    static constexpr uint16_t kBtnFace = kBarBg;  // match bar background
     static constexpr uint16_t kBtnHi   = 0xC618;  // light grey (top/left bevel)
     static constexpr uint16_t kBtnSh   = 0x1082;  // dark grey  (bottom/right bevel)
 };
