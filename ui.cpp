@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "config.h"
 #include "appconfig.h"
+#include "platform.h"
 #include "telnet.h"
 #include "ftp.h"
 
@@ -34,7 +35,8 @@
 #define HIT_DOWN -4
 
 enum Screen {
-  SC_CLOSED, SC_MAIN, SC_WIFI_PICKER, SC_VZ80_PICKER,
+  SC_CLOSED, SC_MAIN, SC_DRIVES, SC_DRIVE, SC_DISK_PICKER,
+  SC_WIFI_PICKER, SC_VZ80_PICKER,
   SC_CONFIRM_COPY, SC_INFO, SC_BRIGHT, SC_CONFIRM_RESET
 };
 
@@ -54,7 +56,11 @@ static uint8_t g_bright = 255;
 static char g_variants[MAX_VARIANTS][44];
 static int g_variant_count = 0;
 
-#define MAX_ITEMS 20
+#define MAX_FILES 64
+static char g_files[MAX_FILES][44];
+static int g_file_count = 0;
+
+#define MAX_ITEMS 68
 static char g_title[40];
 static char g_items[MAX_ITEMS][44];
 static int g_count = 0;
@@ -62,6 +68,9 @@ static int g_count = 0;
 static char g_pending_src[72];
 static char g_pending_dst[32];
 static char g_pending_name[44];
+static UiDriveMountFn g_drive_mount_fn = nullptr;
+
+static const char* const DRIVE_NAMES[4] = { "A", "B", "C", "D" };
 
 static const String* drive_path(int d) {
   switch (d) {
@@ -73,6 +82,45 @@ static const String* drive_path(int d) {
   }
 }
 
+static String* mutable_drive_path(int d) {
+  switch (d) {
+    case 0: return &cfg.disk_a;
+    case 1: return &cfg.disk_b;
+    case 2: return &cfg.disk_c;
+    case 3: return &cfg.disk_d;
+    default: return &cfg.disk_a;
+  }
+}
+
+static bool supported_disk_ext(const char* base) {
+  const char* dot = strrchr(base, '.');
+  return dot && (!strcasecmp(dot, ".dsk") ||
+                 !strcasecmp(dot, ".hdd") ||
+                 !strcasecmp(dot, ".img"));
+}
+
+static void scan_disk_files() {
+  g_file_count = 0;
+  fs::File root = SD_MMC.open("/");
+  if (!root) return;
+
+  for (fs::File f = root.openNextFile(); f && g_file_count < MAX_FILES;
+       f = root.openNextFile()) {
+    if (!f.isDirectory()) {
+      const char* n = f.name();
+      const char* slash = strrchr(n, '/');
+      const char* base = slash ? slash + 1 : n;
+      if (supported_disk_ext(base)) {
+        strncpy(g_files[g_file_count], base, sizeof(g_files[g_file_count]) - 1);
+        g_files[g_file_count][sizeof(g_files[g_file_count]) - 1] = 0;
+        g_file_count++;
+      }
+    }
+    f.close();
+  }
+  root.close();
+}
+
 void ui_init() {
   g_screen = SC_CLOSED;
   g_dirty = false;
@@ -81,6 +129,10 @@ void ui_init() {
   g_esp_restart = false;
   ledcAttach(TFT_BL, 5000, 8);
   ledcWrite(TFT_BL, g_bright);
+}
+
+void ui_set_drive_mount_callback(UiDriveMountFn fn) {
+  g_drive_mount_fn = fn;
 }
 
 bool ui_is_open()             { return g_screen != SC_CLOSED; }
@@ -97,6 +149,7 @@ static void rebuild() {
   switch (g_screen) {
     case SC_MAIN:
       strcpy(g_title, "vZ80 Settings");
+      strcpy(g_items[g_count++], "Drives");
       strcpy(g_items[g_count++], "WiFi Config");
       strcpy(g_items[g_count++], "vZ80 Config");
       strcpy(g_items[g_count++], "System Info");
@@ -104,6 +157,30 @@ static void rebuild() {
       strcpy(g_items[g_count++], "Keyboard");
       strcpy(g_items[g_count++], "Reboot Z80");
       strcpy(g_items[g_count++], "Reset ESP32");
+      break;
+    case SC_DRIVES:
+      strcpy(g_title, "Drives");
+      for (int d = 0; d < 4; d++) {
+        const String* p = drive_path(d);
+        snprintf(g_items[g_count++], 44, "%s: %s",
+                 DRIVE_NAMES[d], p->length() ? p->c_str() : "(empty)");
+      }
+      break;
+    case SC_DRIVE: {
+      const String* p = drive_path(g_sel);
+      snprintf(g_title, sizeof(g_title), "Drive %s", DRIVE_NAMES[g_sel]);
+      strcpy(g_items[g_count++], p->length() ? "Change Image" : "Mount Image");
+      if (p->length()) strcpy(g_items[g_count++], "Dismount");
+      break;
+    }
+    case SC_DISK_PICKER:
+      snprintf(g_title, sizeof(g_title), "Mount into %s", DRIVE_NAMES[g_sel]);
+      for (int i = 0; i < g_file_count && g_count < MAX_ITEMS; i++) {
+        strncpy(g_items[g_count], g_files[i], sizeof(g_items[g_count]) - 1);
+        g_items[g_count][sizeof(g_items[g_count]) - 1] = 0;
+        g_count++;
+      }
+      if (g_count == 0) strcpy(g_items[g_count++], "(no disk images)");
       break;
     case SC_WIFI_PICKER:
       strcpy(g_title, "Select WiFi Config");
@@ -170,6 +247,13 @@ static int list_hit(int x, int y) {
 static void back() {
   switch (g_screen) {
     case SC_MAIN: g_screen = SC_CLOSED; g_dirty = true; break;
+    case SC_DRIVES:
+      go(SC_MAIN);
+      break;
+    case SC_DRIVE:
+    case SC_DISK_PICKER:
+      go(SC_DRIVES);
+      break;
     case SC_WIFI_PICKER:
     case SC_VZ80_PICKER:
     case SC_INFO:
@@ -201,13 +285,41 @@ static void activate(int idx) {
 
   switch (g_screen) {
     case SC_MAIN:
-      if      (idx == 0) { scan_variants("wificonfig-"); go(SC_WIFI_PICKER); }
-      else if (idx == 1) { scan_variants("z80config-"); go(SC_VZ80_PICKER); }
-      else if (idx == 2) go(SC_INFO);
-      else if (idx == 3) go(SC_BRIGHT);
-      else if (idx == 4) { g_keyboard = true; g_screen = SC_CLOSED; g_dirty = true; }
-      else if (idx == 5) { g_reboot = true; g_screen = SC_CLOSED; g_dirty = true; }
-      else if (idx == 6) go(SC_CONFIRM_RESET);
+      if      (idx == 0) go(SC_DRIVES);
+      else if (idx == 1) { scan_variants("wificonfig-"); go(SC_WIFI_PICKER); }
+      else if (idx == 2) { scan_variants("z80config-"); go(SC_VZ80_PICKER); }
+      else if (idx == 3) go(SC_INFO);
+      else if (idx == 4) go(SC_BRIGHT);
+      else if (idx == 5) { g_keyboard = true; g_screen = SC_CLOSED; g_dirty = true; }
+      else if (idx == 6) { g_reboot = true; g_screen = SC_CLOSED; g_dirty = true; }
+      else if (idx == 7) go(SC_CONFIRM_RESET);
+      break;
+    case SC_DRIVES:
+      if (idx >= 0 && idx < 4) {
+        g_sel = idx;
+        go(SC_DRIVE);
+      }
+      break;
+    case SC_DRIVE:
+      if (idx == 0) {
+        scan_disk_files();
+        go(SC_DISK_PICKER);
+      } else if (idx == 1) {
+        bool ok = g_drive_mount_fn ? g_drive_mount_fn((uint8_t)g_sel, "") : false;
+        if (ok) *mutable_drive_path(g_sel) = "";
+        LOG("ui: dismount %s: %s", DRIVE_NAMES[g_sel], ok ? "ok" : "FAIL");
+        go(SC_DRIVES);
+      }
+      break;
+    case SC_DISK_PICKER:
+      if (g_file_count > 0 && idx < g_file_count) {
+        char path[64];
+        snprintf(path, sizeof(path), "/%s", g_files[idx]);
+        bool ok = g_drive_mount_fn ? g_drive_mount_fn((uint8_t)g_sel, path) : false;
+        if (ok) *mutable_drive_path(g_sel) = path;
+        LOG("ui: mount %s: %s -> %s", DRIVE_NAMES[g_sel], path, ok ? "ok" : "FAIL");
+        go(SC_DRIVES);
+      }
       break;
     case SC_WIFI_PICKER:
       if (g_variant_count > 0 && idx < g_variant_count)
@@ -262,6 +374,7 @@ bool ui_handle_tap(int x, int y) {
 static void draw_item(TFT_eSPI& tft, int slot, int idx) {
   int y = ITEM_Y0 + slot * ITEM_H;
   uint16_t bg = (idx == g_sel) ? COL_ITEM_HI : COL_ITEM;
+  if (g_screen == SC_DRIVES && idx >= 0 && idx < 4 && drive_path(idx)->length()) bg = COL_ITEM_HI;
   if (g_screen == SC_CONFIRM_RESET && idx == 0) bg = COL_DANGER;
 
   tft.fillRoundRect(6, y + 3, 308, ITEM_H - 6, 4, bg);

@@ -233,6 +233,11 @@ static bool mount_configured_drives() {
   return ok;
 }
 
+static bool ui_mount_drive(uint8_t drive, const char* path) {
+  if (drive >= AltairBios::MAX_DRIVES) return false;
+  return mount_drive(drive, path);
+}
+
 static void inject_boot_text() {
   if (!rxStream || cfg.boot_input_len == 0) return;
   size_t sent = xStreamBufferSend(rxStream, cfg.boot_input, cfg.boot_input_len, 0);
@@ -505,6 +510,7 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   touch_init();
   ui_init();
+  ui_set_drive_mount_callback(ui_mount_drive);
   console_init();
   apply_console_terminal_mode();
 

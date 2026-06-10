@@ -5,6 +5,9 @@ class TFT_eSPI;
 
 void ui_init();
 
+typedef bool (*UiDriveMountFn)(uint8_t drive, const char* path);
+void ui_set_drive_mount_callback(UiDriveMountFn fn);
+
 // Open the settings menu (caller detects the double-tap gesture).
 void ui_open();
 
