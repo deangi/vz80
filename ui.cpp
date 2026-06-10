@@ -40,7 +40,8 @@
 enum Screen {
   SC_CLOSED, SC_MAIN, SC_DRIVES, SC_DRIVE, SC_DISK_PICKER,
   SC_WIFI_PICKER, SC_VZ80_PICKER,
-  SC_CONFIRM_COPY, SC_INFO, SC_BRIGHT, SC_CONFIRM_RESET
+  SC_CONFIRM_COPY, SC_CONFIRM_DRIVE_REBOOT, SC_INFO, SC_BRIGHT,
+  SC_CONFIRM_RESET
 };
 
 extern AppConfig cfg;
@@ -200,6 +201,11 @@ static void rebuild() {
       strcpy(g_items[g_count++], "Apply and Reset ESP32");
       strcpy(g_items[g_count++], "Cancel");
       break;
+    case SC_CONFIRM_DRIVE_REBOOT:
+      strcpy(g_title, "Reboot after drive change?");
+      strcpy(g_items[g_count++], "Reboot Z80");
+      strcpy(g_items[g_count++], "Continue Running");
+      break;
     case SC_INFO:
       strcpy(g_title, "System Info");
       break;
@@ -268,6 +274,9 @@ static void back() {
     case SC_CONFIRM_COPY:
       go(g_after_cancel);
       break;
+    case SC_CONFIRM_DRIVE_REBOOT:
+      go(SC_DRIVES);
+      break;
     default:
       go(SC_MAIN);
       break;
@@ -312,7 +321,7 @@ static void activate(int idx) {
         bool ok = g_drive_mount_fn ? g_drive_mount_fn((uint8_t)g_sel, "") : false;
         if (ok) *mutable_drive_path(g_sel) = "";
         LOG("ui: dismount %s: %s", DRIVE_NAMES[g_sel], ok ? "ok" : "FAIL");
-        if (ok) { g_reboot = true; go(SC_DRIVES); }
+        if (ok) go(SC_CONFIRM_DRIVE_REBOOT);
         else go(SC_DRIVES);
       }
       break;
@@ -323,7 +332,7 @@ static void activate(int idx) {
         bool ok = g_drive_mount_fn ? g_drive_mount_fn((uint8_t)g_sel, path) : false;
         if (ok) *mutable_drive_path(g_sel) = path;
         LOG("ui: mount %s: %s -> %s", DRIVE_NAMES[g_sel], path, ok ? "ok" : "FAIL");
-        if (ok) { g_reboot = true; go(SC_DRIVES); }
+        if (ok) go(SC_CONFIRM_DRIVE_REBOOT);
         else go(SC_DRIVES);
       }
       break;
@@ -343,6 +352,15 @@ static void activate(int idx) {
         go(g_after_cancel);
       }
       g_dirty = true;
+      break;
+    case SC_CONFIRM_DRIVE_REBOOT:
+      if (idx == 0) {
+        g_reboot = true;
+        g_screen = SC_CLOSED;
+        g_dirty = true;
+      } else {
+        go(SC_DRIVES);
+      }
       break;
     case SC_CONFIRM_RESET:
       if (idx == 0) { g_esp_restart = true; g_screen = SC_CLOSED; g_dirty = true; }

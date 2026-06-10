@@ -2,7 +2,7 @@
 
 // ---- App metadata ----
 #define APP_TITLE       "vZ80"
-#define APP_VERSION     "V2.1"
+#define APP_VERSION     "V2.2"
 #define APP_BUILD_DATE  "2026-06-10"
 
 // ---- RGB LED (WS2812) ----
