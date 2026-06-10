@@ -1,0 +1,349 @@
+#include "ui.h"
+#include "config.h"
+#include "appconfig.h"
+#include "telnet.h"
+#include "ftp.h"
+
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <SD_MMC.h>
+#include <string.h>
+
+#ifndef TFT_BL
+#define TFT_BL 45
+#endif
+
+#define COL_BG       0x0009
+#define COL_TITLE    0x001F
+#define COL_ITEM     0x4208
+#define COL_ITEM_HI  0x0320
+#define COL_TEXT     TFT_WHITE
+#define COL_DIM      0x9CD3
+#define COL_DANGER   0xC000
+
+#define MENU_VISIBLE 4
+#define ITEM_Y0      26
+#define ITEM_H       44
+#define NAV_Y        204
+#define MENU_HIT_Y_BIAS 6
+
+#define HIT_NONE -1
+#define HIT_BACK -2
+#define HIT_UP   -3
+#define HIT_DOWN -4
+
+enum Screen {
+  SC_CLOSED, SC_MAIN, SC_WIFI_PICKER, SC_VZ80_PICKER,
+  SC_CONFIRM_COPY, SC_INFO, SC_BRIGHT, SC_CONFIRM_RESET
+};
+
+extern AppConfig cfg;
+
+static Screen g_screen = SC_CLOSED;
+static Screen g_after_cancel = SC_MAIN;
+static bool g_dirty = false;
+static bool g_reboot = false;
+static bool g_keyboard = false;
+static bool g_esp_restart = false;
+static int g_sel = 0;
+static int g_scroll = 0;
+static uint8_t g_bright = 255;
+
+#define MAX_VARIANTS 16
+static char g_variants[MAX_VARIANTS][44];
+static int g_variant_count = 0;
+
+#define MAX_ITEMS 20
+static char g_title[40];
+static char g_items[MAX_ITEMS][44];
+static int g_count = 0;
+
+static char g_pending_src[72];
+static char g_pending_dst[32];
+static char g_pending_name[44];
+
+static const String* drive_path(int d) {
+  switch (d) {
+    case 0: return &cfg.disk_a;
+    case 1: return &cfg.disk_b;
+    case 2: return &cfg.disk_c;
+    case 3: return &cfg.disk_d;
+    default: return &cfg.disk_a;
+  }
+}
+
+void ui_init() {
+  g_screen = SC_CLOSED;
+  g_dirty = false;
+  g_reboot = false;
+  g_keyboard = false;
+  g_esp_restart = false;
+  ledcAttach(TFT_BL, 5000, 8);
+  ledcWrite(TFT_BL, g_bright);
+}
+
+bool ui_is_open()             { return g_screen != SC_CLOSED; }
+bool ui_consume_reboot()      { bool r = g_reboot; g_reboot = false; return r; }
+bool ui_consume_keyboard()    { bool r = g_keyboard; g_keyboard = false; return r; }
+bool ui_consume_esp_restart() { bool r = g_esp_restart; g_esp_restart = false; return r; }
+
+static void scan_variants(const char* prefix) {
+  g_variant_count = config_list_variants(prefix, g_variants, MAX_VARIANTS);
+}
+
+static void rebuild() {
+  g_count = 0;
+  switch (g_screen) {
+    case SC_MAIN:
+      strcpy(g_title, "vZ80 Settings");
+      strcpy(g_items[g_count++], "WiFi Config");
+      strcpy(g_items[g_count++], "vZ80 Config");
+      strcpy(g_items[g_count++], "System Info");
+      strcpy(g_items[g_count++], "Brightness");
+      strcpy(g_items[g_count++], "Keyboard");
+      strcpy(g_items[g_count++], "Reboot Z80");
+      strcpy(g_items[g_count++], "Reset ESP32");
+      break;
+    case SC_WIFI_PICKER:
+      strcpy(g_title, "Select WiFi Config");
+      for (int i = 0; i < g_variant_count && g_count < MAX_ITEMS; i++)
+        snprintf(g_items[g_count++], 44, "wificonfig-%s.ini", g_variants[i]);
+      if (g_count == 0) strcpy(g_items[g_count++], "(no variants)");
+      break;
+    case SC_VZ80_PICKER:
+      strcpy(g_title, "Select vZ80 Config");
+      for (int i = 0; i < g_variant_count && g_count < MAX_ITEMS; i++)
+        snprintf(g_items[g_count++], 44, "z80config-%s.ini", g_variants[i]);
+      if (g_count == 0) strcpy(g_items[g_count++], "(no variants)");
+      break;
+    case SC_CONFIRM_COPY:
+      snprintf(g_title, sizeof(g_title), "Use %s?", g_pending_name);
+      strcpy(g_items[g_count++], "Apply and Reset ESP32");
+      strcpy(g_items[g_count++], "Cancel");
+      break;
+    case SC_INFO:
+      strcpy(g_title, "System Info");
+      break;
+    case SC_BRIGHT:
+      snprintf(g_title, sizeof(g_title), "Brightness  %d%%", (g_bright * 100) / 255);
+      strcpy(g_items[g_count++], "-  Dimmer");
+      strcpy(g_items[g_count++], "+  Brighter");
+      break;
+    case SC_CONFIRM_RESET:
+      strcpy(g_title, "Reset ESP32 now?");
+      strcpy(g_items[g_count++], "Reset ESP32");
+      strcpy(g_items[g_count++], "Cancel");
+      break;
+    default:
+      break;
+  }
+
+  if (g_scroll > g_count - MENU_VISIBLE) g_scroll = g_count - MENU_VISIBLE;
+  if (g_scroll < 0) g_scroll = 0;
+}
+
+static void go(Screen s) {
+  g_screen = s;
+  g_scroll = 0;
+  rebuild();
+  g_dirty = true;
+}
+
+void ui_open() { go(SC_MAIN); }
+
+static int list_hit(int x, int y) {
+  int hy = y + MENU_HIT_Y_BIAS;
+  if (hy >= ITEM_Y0 && hy < ITEM_Y0 + MENU_VISIBLE * ITEM_H && x >= 6 && x < 314)
+    return (hy - ITEM_Y0) / ITEM_H;
+  if (y >= NAV_Y) {
+    if (g_count > MENU_VISIBLE) {
+      if (x < 156) return HIT_BACK;
+      if (x < 236) return HIT_UP;
+      return HIT_DOWN;
+    }
+    return HIT_BACK;
+  }
+  return HIT_NONE;
+}
+
+static void back() {
+  switch (g_screen) {
+    case SC_MAIN: g_screen = SC_CLOSED; g_dirty = true; break;
+    case SC_WIFI_PICKER:
+    case SC_VZ80_PICKER:
+    case SC_INFO:
+    case SC_BRIGHT:
+    case SC_CONFIRM_RESET:
+      go(SC_MAIN);
+      break;
+    case SC_CONFIRM_COPY:
+      go(g_after_cancel);
+      break;
+    default:
+      go(SC_MAIN);
+      break;
+  }
+}
+
+static void prepare_config_copy(const char* prefix, const char* variant,
+                                const char* dst, Screen after_cancel) {
+  snprintf(g_pending_src, sizeof(g_pending_src), "/%s%s.ini", prefix, variant);
+  strncpy(g_pending_dst, dst, sizeof(g_pending_dst) - 1);
+  g_pending_dst[sizeof(g_pending_dst) - 1] = 0;
+  snprintf(g_pending_name, sizeof(g_pending_name), "%s%s.ini", prefix, variant);
+  g_after_cancel = after_cancel;
+  go(SC_CONFIRM_COPY);
+}
+
+static void activate(int idx) {
+  if (idx < 0 || idx >= g_count) return;
+
+  switch (g_screen) {
+    case SC_MAIN:
+      if      (idx == 0) { scan_variants("wificonfig-"); go(SC_WIFI_PICKER); }
+      else if (idx == 1) { scan_variants("z80config-"); go(SC_VZ80_PICKER); }
+      else if (idx == 2) go(SC_INFO);
+      else if (idx == 3) go(SC_BRIGHT);
+      else if (idx == 4) { g_keyboard = true; g_screen = SC_CLOSED; g_dirty = true; }
+      else if (idx == 5) { g_reboot = true; g_screen = SC_CLOSED; g_dirty = true; }
+      else if (idx == 6) go(SC_CONFIRM_RESET);
+      break;
+    case SC_WIFI_PICKER:
+      if (g_variant_count > 0 && idx < g_variant_count)
+        prepare_config_copy("wificonfig-", g_variants[idx], WIFI_CFG_PATH, SC_WIFI_PICKER);
+      break;
+    case SC_VZ80_PICKER:
+      if (g_variant_count > 0 && idx < g_variant_count)
+        prepare_config_copy("z80config-", g_variants[idx], VZ80_CFG_PATH, SC_VZ80_PICKER);
+      break;
+    case SC_CONFIRM_COPY:
+      if (idx == 0 && config_copy_file(g_pending_src, g_pending_dst)) {
+        g_esp_restart = true;
+        g_screen = SC_CLOSED;
+      } else {
+        go(g_after_cancel);
+      }
+      g_dirty = true;
+      break;
+    case SC_CONFIRM_RESET:
+      if (idx == 0) { g_esp_restart = true; g_screen = SC_CLOSED; g_dirty = true; }
+      else go(SC_MAIN);
+      break;
+    case SC_BRIGHT:
+      if (idx == 0 && g_bright > 16) g_bright -= 16;
+      if (idx == 1 && g_bright < 239) g_bright += 16;
+      ledcWrite(TFT_BL, g_bright);
+      rebuild();
+      g_dirty = true;
+      break;
+    default:
+      break;
+  }
+}
+
+bool ui_handle_tap(int x, int y) {
+  if (g_screen == SC_CLOSED) return false;
+  int h = list_hit(x, y);
+  if (h == HIT_NONE) return true;
+  if (h == HIT_BACK) { back(); return true; }
+  if (h == HIT_UP) {
+    if (g_scroll > 0) { g_scroll--; g_dirty = true; }
+    return true;
+  }
+  if (h == HIT_DOWN) {
+    if (g_scroll + MENU_VISIBLE < g_count) { g_scroll++; g_dirty = true; }
+    return true;
+  }
+  activate(g_scroll + h);
+  return true;
+}
+
+static void draw_item(TFT_eSPI& tft, int slot, int idx) {
+  int y = ITEM_Y0 + slot * ITEM_H;
+  uint16_t bg = (idx == g_sel) ? COL_ITEM_HI : COL_ITEM;
+  if (g_screen == SC_CONFIRM_RESET && idx == 0) bg = COL_DANGER;
+
+  tft.fillRoundRect(6, y + 3, 308, ITEM_H - 6, 4, bg);
+  tft.setTextColor(COL_TEXT, bg);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString(g_items[idx], 18, y + ITEM_H / 2, 2);
+  tft.setTextDatum(TL_DATUM);
+}
+
+static void draw_nav(TFT_eSPI& tft) {
+  tft.fillRect(0, NAV_Y, TFT_W, TFT_H - NAV_Y, COL_BG);
+  tft.fillRoundRect(6, NAV_Y + 4, 144, 28, 4, COL_TITLE);
+  tft.setTextColor(TFT_WHITE, COL_TITLE);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Back", 78, NAV_Y + 18, 2);
+
+  if (g_count > MENU_VISIBLE) {
+    tft.fillRoundRect(160, NAV_Y + 4, 72, 28, 4, g_scroll > 0 ? COL_TITLE : COL_ITEM);
+    tft.drawString("Up", 196, NAV_Y + 18, 2);
+    tft.fillRoundRect(242, NAV_Y + 4, 72, 28, 4,
+                      g_scroll + MENU_VISIBLE < g_count ? COL_TITLE : COL_ITEM);
+    tft.drawString("Down", 278, NAV_Y + 18, 2);
+  }
+  tft.setTextDatum(TL_DATUM);
+}
+
+static void draw_info(TFT_eSPI& tft) {
+  tft.fillRect(0, ITEM_Y0, TFT_W, NAV_Y - ITEM_Y0, COL_BG);
+  tft.setTextFont(1);
+  tft.setTextColor(TFT_WHITE, COL_BG);
+  int y = ITEM_Y0 + 2;
+  char line[96];
+
+  auto row = [&](const char* s, uint16_t col = TFT_WHITE) {
+    tft.setTextColor(col, COL_BG);
+    tft.drawString(s, 8, y, 1);
+    y += 12;
+  };
+
+  snprintf(line, sizeof(line), "Firmware: %s  build %s", APP_VERSION, APP_BUILD_DATE);
+  row(line);
+  snprintf(line, sizeof(line), "Profile: %s", cfg.title.c_str());
+  row(line);
+  snprintf(line, sizeof(line), "WiFi: %s", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "not connected");
+  row(line, WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_YELLOW);
+  snprintf(line, sizeof(line), "Telnet: %s port %u",
+           telnet_connected() ? "connected" : (telnet_listening() ? "listening" : "off"),
+           telnet_port());
+  row(line, telnet_connected() ? TFT_YELLOW : (telnet_listening() ? TFT_GREEN : COL_DIM));
+  snprintf(line, sizeof(line), "FTP: %s port %u user %s",
+           ftp_connected() ? "connected" : (ftp_listening() ? "listening" : "off"),
+           ftp_port(), cfg.ftp_user.c_str());
+  row(line, ftp_connected() ? TFT_YELLOW : (ftp_listening() ? TFT_GREEN : COL_DIM));
+  snprintf(line, sizeof(line), "A:%s", drive_path(0)->length() ? drive_path(0)->c_str() : "(empty)");
+  row(line);
+  snprintf(line, sizeof(line), "B:%s", drive_path(1)->length() ? drive_path(1)->c_str() : "(empty)");
+  row(line);
+  snprintf(line, sizeof(line), "C:%s", drive_path(2)->length() ? drive_path(2)->c_str() : "(empty)");
+  row(line);
+  snprintf(line, sizeof(line), "D:%s", drive_path(3)->length() ? drive_path(3)->c_str() : "(empty)");
+  row(line);
+}
+
+void ui_draw(TFT_eSPI& tft) {
+  if (g_screen == SC_CLOSED || !g_dirty) return;
+  g_dirty = false;
+
+  tft.fillScreen(COL_BG);
+  tft.fillRect(0, 0, TFT_W, 24, COL_TITLE);
+  tft.setTextColor(TFT_WHITE, COL_TITLE);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString(g_title, 8, 12, 2);
+  tft.setTextDatum(TL_DATUM);
+
+  if (g_screen == SC_INFO) {
+    draw_info(tft);
+  } else {
+    tft.fillRect(0, ITEM_Y0, TFT_W, NAV_Y - ITEM_Y0, COL_BG);
+    for (int i = 0; i < MENU_VISIBLE; i++) {
+      int idx = g_scroll + i;
+      if (idx < g_count) draw_item(tft, i, idx);
+    }
+  }
+  draw_nav(tft);
+}

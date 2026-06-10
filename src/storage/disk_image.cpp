@@ -13,7 +13,7 @@ bool DiskImage::open(const char* path, uint16_t tracks, uint8_t spt,
 
     // "r+" = read+write without truncation. FILE_WRITE ("w") would erase the
     // disk image on open, so we never use it for an existing .dsk.
-    file_ = SD.open(path_, writable ? "r+" : "r");
+    file_ = SD_MMC.open(path_, writable ? "r+" : "r");
     if (!file_) return false;
 
     uint32_t expected = (uint32_t)tracks_ * sectorsPerTrack_ * sectorBytes_;

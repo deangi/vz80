@@ -1,6 +1,6 @@
 #pragma once
 #include <Arduino.h>
-#include <SD.h>
+#include <SD_MMC.h>
 #include <FS.h>
 
 // Raw .dsk image on SD: flat (track * sectorsPerTrack + (sector-1)) * sectorBytes.
@@ -27,7 +27,7 @@ public:
     const char* path()        const { return path_; }
 
 private:
-    File     file_;
+    fs::File file_;
     char     path_[64]{};
     uint16_t tracks_ = 0;
     uint8_t  sectorsPerTrack_ = 0;

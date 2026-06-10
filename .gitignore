@@ -1,32 +1,17 @@
-# Local Claude Code state
-.claude/
+# Upstream/reference material. Not needed to build.
+_upstream_*
 
-# Local config (lives on SD, contains wifi/ftp creds)
-config.json
-
-# CP/M / Altair disk images (large, user-specific)
-*.dsk
-*.hdd
-*.img
-*.bin
-data/*
-!data/.gitkeep
-
-# Touch panel calibration (per-device)
-touch_cal.bin
-
-# Arduino IDE build artifacts
+# Build artifacts
 build/
-*.elf
-*.hex
-*.map
-*.partitions
+.build-codex/
+*.bin
 
-# OS junk
-.DS_Store
-Thumbs.db
-desktop.ini
+# SD-card payloads/examples that are too large or user-specific for git.
+Z80SdCard/wificonfig-dean.ini
+Z80SdCard/*.backup
+Z80SdCard/*.dsk
+Z80SdCard/*.hdd
+Z80SdCard/touch_cal.bin
 
-# Shipped SD-card templates (depersonalized config + default disk image)
-!sdcard/config.json
-!sdcard/*.dsk
+# Plan / scratch
+*.tmp

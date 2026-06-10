@@ -1,621 +1,592 @@
-// vZ80 - Z80/CP/M 2.2 emulator for ESP32 Cheap Yellow Display (CYD)
-// Target 1: xxxx ESP32-2432S028R (ILI9341 320x240, XPT2046 touch, SD slot)
-// Switched to a different target board:
-// Target 2: 2 USB CYD board (ST7789 driver instead of ILI9341), Micro USB and USB-C both
-// Use HUGE APP partitioning on the board.
-//
-// M1: splash + SD                                                      .
-// M2: 80x24 console (5x7 font, horizontal scroll viewport)             .
-// M3: Z80 emulator (superzazu/z80, MIT) + 64KB RAM + console I/O ports .
-// M4: CP/M 2.2 boot from Altair iCOM 3712 .DSK image.                  .
-// M5: Touch control panel (top 48 px) + mount modal.
-//     MNT opens a full-screen overlay; the Z80 task is suspended while
-//     the modal is up so BDOS can't catch a half-swapped disk.
-// M6: BT keyboard — REMOVED, insufficient internal RAM (BT + WiFi cannot
-//     coexist on this ESP32 board; no PSRAM). Keyboard input is now
-//     telnet-only (M7).
-// M7: WiFi STA + telnet (port 23) + VT-100 escape parsing on the LCD.
-// M8: on-screen US-QWERTY keyboard (modal overlay, sticky SHFT/CTRL).
-//     Tap KBD on the top strip to toggle.
-//
-// Serial -> Z80 rx bridge stays in place as a debugging input path; the
-// production input path is telnet over WiFi.
-//
-// Required Arduino libraries:
-//   - LovyanGFX       (lovyan03)        V1.2.19+
-//   - ArduinoJson     (bblanchon)       V7.4.3
-//   - SimpleFTPServer (Renzo Mischianti) V3.0.2  — only if ENABLE_FTP=1
+// board: esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi
+// vZ80 - Z80 / CP/M emulator on Freenove ESP32-S3 2.8" Display
+// Dean Gienger and Codex and Claude, 9 Jun 2026
+// Boots up a version of cpm2.2 from Altair, 48k version from floppy disk
+// ESP32S3 Dev Module board, 16Mb Flash, 8Mb PSRAM, 2.8" dispay with capacitive touch screen
+// Partition: 16M flash (3Mb app/9.9Mb SPIFAT)
+// Tools: CDC On Boot=true
+//----------------------------------------------------------------------------
 
 #include <Arduino.h>
-#include <SPI.h>
-#include <SD.h>
+#include <WiFi.h>
+#include <TFT_eSPI.h>
+#include <SD_MMC.h>
 #include <FS.h>
-#include <ArduinoJson.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/stream_buffer.h>
+#include "Freenove_WS2812_Lib_for_ESP32.h"
 
-#include "ESP32_SPI_9341.h"
-#include "src/display/console.h"
+#include "config.h"
+#include "platform.h"
+#include "secrets.h"
+#include "appconfig.h"
+#include "console.h"
+#include "telnet.h"
+#include "ftp.h"
+#include "touch.h"
+#include "ui.h"
 #include "src/z80/z80_cpu.h"
 #include "src/storage/disk_image.h"
 #include "src/cpm/altair_bios.h"
-#include "src/ui/touch_panel.h"
-#include "src/ui/mount_modal.h"
-#include "src/ui/setup_modal.h"
 #include "src/ui/keyboard_modal.h"
-#include "src/hw/RgbLed.h"
-#include "src/network/wifi_sta.h"
-#include "src/network/telnet_server.h"
-#include "src/network/ftp_server.h"
 
-// Build identification — bumped on user-visible changes. Shown in the
-// SETUP popup so the running build is obvious without checking serial.
-static const char VZ80_VERSION[]    = "1.6";
-static const char VZ80_BUILD_DATE[] = "2026-05-17";
+static TFT_eSPI tft;
+static Freenove_ESP32_WS2812 strip(LED_COUNT, LED_PIN, LED_CHANNEL, TYPE_GRB);
+AppConfig cfg;
 
-// Bluetooth removed (was M6). The original ESP32 in the CYD2USB has too
-// little internal DRAM to host both WiFi and Bluedroid simultaneously:
-// WiFi alone leaves ~17 KB free heap with the largest contiguous block
-// at ~16 KB, while esp_bluedroid_init() needs >15 KB contiguous and
-// crashes (LoadProhibited) when its internal alloc returns NULL. Even
-// tearing WiFi down at runtime doesn't help — the freed heap stays
-// fragmented. There's no PSRAM on this board (we probed at boot and the
-// QPI handshake fails), so Z80 RAM can't be moved off internal DRAM
-// either. Net: BT and WiFi cannot coexist here. Keyboard input now
-// comes from telnet over WiFi (src/network/telnet_server.{h,cpp}).
-// Future M8: on-screen keyboard for keyboard-less use.
+static bool sd_ok = false;
+static bool z80_running = false;
+static SemaphoreHandle_t g_ui_mutex = nullptr;
 
-// -----------------------------------------------------------------------------
-// Pin assignments (display pins live in ESP32_SPI_9341.h)
-// -----------------------------------------------------------------------------
-static const uint8_t SD_CS_PIN   = 5;
-static const uint8_t SD_SCK_PIN  = 18;
-static const uint8_t SD_MISO_PIN = 19;
-static const uint8_t SD_MOSI_PIN = 23;
+static Z80CPU cpu;
+static AltairBios bios;
+static DiskImage disks[AltairBios::MAX_DRIVES];
+static StreamBufferHandle_t txStream = nullptr;  // Z80 -> console/Telnet
+static StreamBufferHandle_t rxStream = nullptr;  // Serial/Telnet -> Z80
+static KeyboardModal keyboard;
 
-// On-board RGB LED — common-anode (active LOW). Pin numbers are the
-// CYD/CYD2USB defaults; verify against your board if the LED behaves
-// unexpectedly.
-static const int RGB_R_PIN     = 4;
-static const int RGB_G_PIN     = 16;
-static const int RGB_B_PIN     = 17;
-static const int RGB_ACTIVE_LOW = 1;   // 1 = LOW turns the LED on
+static volatile uint32_t g_last_cycles = 0;
+static volatile bool g_boot_ok = false;
+static volatile bool g_keyboard_open = false;
 
-// -----------------------------------------------------------------------------
-// Globals
-// -----------------------------------------------------------------------------
-static LGFX        lcd;
-// SD shares HSPI with the display (bus_shared=true on the panel). Touch
-// owns VSPI on its own pins. Do not put SD on VSPI - it will remap VSPI's
-// pins and the XPT2046 touch goes silent (demo1 uses this same layout).
-static SPIClass    sdSPI(HSPI);
-static Console     console;
-static Z80CPU      cpu;
-static AltairBios  bios;
-static DiskImage   disks[4];   // A, B, C, D
-static TouchPanel    touchPanel;
-static MountModal    mountModal;
-static SetupModal    setupModal;
-static KeyboardModal kbdModal;
-static bool          kbdOpen = false;
-static RgbLed        rgbLed(RGB_R_PIN, RGB_G_PIN, RGB_B_PIN, RGB_ACTIVE_LOW);
+enum {
+  ROW_PSRAM = 0, ROW_SD, ROW_CFG, ROW_WIFI, ROW_IP, ROW_CPU
+};
 
-static StreamBufferHandle_t txStream = nullptr;  // Z80 -> display
-static StreamBufferHandle_t rxStream = nullptr;  // keyboard -> Z80
-
-static TaskHandle_t z80TaskHandle = nullptr;
-static bool         z80Running    = false;
-
-static char cfgDrives[4][64] = { "altair48k.dsk", "", "", "" };
-static char cfgAppName[24] = "vZ80";  // shown as title in the top strip
-
-// Network config (M7). Loaded from /config.json; empty SSID disables WiFi.
-static char cfgWifiSsid[33] = "";
-static char cfgWifiPass[65] = "";
-static char cfgFtpUser[33]  = "cpm";
-static char cfgFtpPass[33]  = "cpm";
-static bool cfgFtpEnabled = true;
-static bool cfgTelnetEnabled = true;
-static uint16_t cfgTelnetPort = 23;
-static char cfgTerminal[8] = "vt100";  // "vt100" or "adm3a"
-
-// -----------------------------------------------------------------------------
-// WiFi event hooks. These fire on the system event task (core 0) — keep
-// them brief and defer real work to the main loop via flags.
-// -----------------------------------------------------------------------------
-static volatile bool netStartupPending_ = false;
-static volatile bool netTeardownPending_ = false;
-
-static void onWifiConnected()    { netStartupPending_ = true; }
-static void onWifiDisconnected() { netTeardownPending_ = true; }
-
-// -----------------------------------------------------------------------------
-static bool initSD() {
-    sdSPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN);
-    if (!SD.begin(SD_CS_PIN, sdSPI, 20000000)) return false;
-    return SD.cardType() != CARD_NONE;
+static void led(uint8_t r, uint8_t g, uint8_t b) {
+  strip.setLedColorData(0, r, g, b);
+  strip.show();
 }
 
-static void fatal(const char* msg) {
-    lcd.fillScreen(TFT_BLACK);
-    lcd.setTextColor(TFT_RED, TFT_BLACK);
-    lcd.setTextSize(2);
-    lcd.setCursor(8, 8);
-    lcd.printf("FATAL: %s", msg);
-    Serial.printf("[FATAL] %s\n", msg);
-    while (true) { delay(1000); }
+static void tft_banner() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setCursor(4, 4);
+  tft.printf("%s  %s", APP_TITLE, APP_VERSION);
+  tft.setCursor(4, 22);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.printf("build %s", APP_BUILD_DATE);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
 }
 
-static void copyCfgStr(char* dst, size_t dst_size, const char* src) {
-    if (!src) { dst[0] = 0; return; }
-    strncpy(dst, src, dst_size - 1);
-    dst[dst_size - 1] = 0;
+static void tft_status(int row, const char* label, const char* value, uint16_t color) {
+  int y = 50 + row * 18;
+  tft.fillRect(0, y, TFT_W, 18, TFT_BLACK);
+  tft.setCursor(4, y);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.print(label);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.print(value);
 }
 
-static bool loadConfig() {
-    File f = SD.open("/config.json", FILE_READ);
-    if (!f) { Serial.println("config.json missing - defaults"); return true; }
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, f);
-    f.close();
-    if (err) { Serial.printf("config: %s\n", err.c_str()); return false; }
+static void wifi_connect() {
+  const char* ssid = cfg.wifi_ssid.c_str();
+  const char* pass = cfg.wifi_password.c_str();
+  const char* host = cfg.wifi_hostname.length() ? cfg.wifi_hostname.c_str() : WIFI_HOSTNAME;
 
-    static const char* kKeys[4] = { "A", "B", "C", "D" };
-    for (int i = 0; i < 4; ++i) {
-        const char* p = doc["drives"][kKeys[i]] | "";
-        if (*p) copyCfgStr(cfgDrives[i], sizeof(cfgDrives[i]), p);
-        else    cfgDrives[i][0] = 0;
-    }
+  if (cfg.wifi_ssid.length() == 0) {
+    LOGE("WiFi SSID is empty - set [wifi] ssid= in %s", WIFI_CFG_PATH);
+    tft_status(ROW_WIFI, "WiFi:  ", "disabled (no SSID)", TFT_YELLOW);
+    tft_status(ROW_IP,   "IP:    ", "(none)", TFT_DARKGREY);
+    return;
+  }
 
-    copyCfgStr(cfgWifiSsid, sizeof(cfgWifiSsid), doc["wifi"]["ssid"]     | "");
-    copyCfgStr(cfgWifiPass, sizeof(cfgWifiPass), doc["wifi"]["password"] | "");
-    copyCfgStr(cfgFtpUser,  sizeof(cfgFtpUser),  doc["ftp"]["user"]      | "cpm");
-    copyCfgStr(cfgFtpPass,  sizeof(cfgFtpPass),  doc["ftp"]["password"]  | "cpm");
-    cfgFtpEnabled    = doc["ftp"]["enabled"]    | true;
-    cfgTelnetEnabled = doc["telnet"]["enabled"] | true;
-    cfgTelnetPort    = doc["telnet"]["port"]    | 23;
-    copyCfgStr(cfgAppName, sizeof(cfgAppName),  doc["app"]["name"] | "vZ80");
-    copyCfgStr(cfgTerminal, sizeof(cfgTerminal),
-               doc["display"]["terminal"] | "vt100");
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(host);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid, pass);
 
-    // Apply terminal personality immediately — console is already begun.
-    // Unrecognized values fall back to VT-100 (the default).
-    if (strcasecmp(cfgTerminal, "adm3a") == 0) {
-        console.setTerminalMode(Console::TM_ADM3A);
-    } else {
-        console.setTerminalMode(Console::TM_VT100);
-    }
+  LOG("WiFi connecting to \"%s\" (hostname=%s) ...", ssid, host);
+  tft_status(ROW_WIFI, "WiFi:  ", "connecting...", TFT_YELLOW);
 
-    Serial.printf("cfg A:=%s B:=%s C:=%s D:=%s\n",
-                  cfgDrives[0], cfgDrives[1], cfgDrives[2], cfgDrives[3]);
-    Serial.printf("cfg wifi=%s ftp=%s telnet=%s:%u term=%s\n",
-                  cfgWifiSsid[0] ? cfgWifiSsid : "(off)",
-                  cfgFtpUser,
-                  cfgTelnetEnabled ? "on" : "off", cfgTelnetPort,
-                  cfgTerminal);
-    return true;
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    LOG("WiFi connected, IP=%s", WiFi.localIP().toString().c_str());
+    tft_status(ROW_WIFI, "WiFi:  ", ssid, TFT_GREEN);
+    tft_status(ROW_IP,   "IP:    ", WiFi.localIP().toString().c_str(), TFT_GREEN);
+  } else {
+    LOGE("WiFi connect timed out");
+    tft_status(ROW_WIFI, "WiFi:  ", "not connected", TFT_YELLOW);
+    tft_status(ROW_IP,   "IP:    ", "(none)", TFT_DARKGREY);
+  }
 }
 
-// Mount a drive from path (no leading slash). Returns true on success.
-// .dsk files use the iCOM 3712 floppy geometry (77x26x128 = 256,256 bytes).
-// .hdd files keep the 26x128 sector layout but derive track count from
-// file size — supports larger CP/M hard-disk images on drives C/D.
-static bool mountDrive(uint8_t drive, const char* name) {
-    if (drive >= 4) return false;
-    DiskImage* img = &disks[drive];
-    if (!name || !*name) { bios.unmount(drive); img->close(); return true; }
-    char path[80];
-    snprintf(path, sizeof(path), "/%s", name);
+static void sd_and_config_init() {
+  tft_status(ROW_SD, "SD:    ", "mounting...", TFT_YELLOW);
+  if (sd_mount()) {
+    char info[32];
+    uint64_t mb = SD_MMC.cardSize() / (1024ULL * 1024ULL);
+    snprintf(info, sizeof(info), "OK  %llu MB", (unsigned long long)mb);
+    tft_status(ROW_SD, "SD:    ", info, TFT_GREEN);
+    sd_ok = true;
+  } else {
+    tft_status(ROW_SD, "SD:    ", "FAILED", TFT_RED);
+    sd_ok = false;
+  }
+
+  tft_status(ROW_CFG, "Cfg:   ", "(reading)", TFT_YELLOW);
+  config_apply_compiled_defaults(cfg);
+  if (!sd_ok) {
+    tft_status(ROW_CFG, "Cfg:   ", "defaults (no SD)", TFT_YELLOW);
+  } else {
+    bool wifi_existed = config_load_wifi(cfg);
+    bool vz80_existed = config_load_vz80(cfg);
+    tft_status(ROW_CFG, "Cfg:   ",
+               (wifi_existed && vz80_existed) ? "loaded split cfg" : "wrote default cfg",
+               (wifi_existed && vz80_existed) ? TFT_GREEN : TFT_YELLOW);
+  }
+  config_print(cfg);
+}
+
+static int boot_slot() {
+  switch (tolower((uint8_t)cfg.boot_drive)) {
+    case 'a': return 0;
+    case 'b': return 1;
+    case 'c': return 2;
+    case 'd': return 3;
+    default:  return 0;
+  }
+}
+
+static bool has_ext(const char* path, const char* ext) {
+  size_t n = strlen(path);
+  size_t e = strlen(ext);
+  return n >= e && strcasecmp(path + n - e, ext) == 0;
+}
+
+static const String* drive_config(int d) {
+  switch (d) {
+    case 0: return &cfg.disk_a;
+    case 1: return &cfg.disk_b;
+    case 2: return &cfg.disk_c;
+    case 3: return &cfg.disk_d;
+    default: return &cfg.disk_a;
+  }
+}
+
+static bool mount_drive(uint8_t drive, const char* name) {
+  if (drive >= AltairBios::MAX_DRIVES) return false;
+
+  DiskImage* img = &disks[drive];
+  if (!name || !*name) {
+    bios.unmount(drive);
     img->close();
-
-    uint16_t tracks = 77;       // floppy default
-    uint8_t  spt    = 26;
-    uint16_t bytes  = 128;
-    size_t   nlen = strlen(name);
-    if (nlen >= 4 && strcasecmp(name + nlen - 4, ".hdd") == 0) {
-        File probe = SD.open(path, FILE_READ);
-        if (!probe) {
-            Serial.printf("mount %c: probe FAIL %s\n", 'A' + drive, path);
-            return false;
-        }
-        size_t sz = probe.size();
-        probe.close();
-        // 26 sectors x 128 bytes per track = 3328 bytes/track. Round down.
-        uint32_t trks = sz / (26u * 128u);
-        if (trks < 1)    trks = 1;
-        if (trks > 4095) trks = 4095;
-        tracks = (uint16_t)trks;
-        Serial.printf("[hdd] %s size=%u -> %u trk x 26 x 128\n",
-                      name, (unsigned)sz, tracks);
-    }
-
-    if (!img->open(path, tracks, spt, bytes, true)) {
-        Serial.printf("mount %c: FAIL %s\n", 'A' + drive, path);
-        return false;
-    }
-    bios.mount(drive, img);
-    Serial.printf("%c: <- %s (%u trk x %u sec x %u byte)\n",
-                  'A' + drive, path, img->tracks(),
-                  img->sectorsPerTrack(), img->sectorBytes());
     return true;
-}
+  }
 
-// Cold-boot CP/M: read trk0 sec1 of A: to 0x0080, set PC, install stubs.
-static bool coldBootCpm() {
-    if (!disks[0].isOpen() && !mountDrive(0, cfgDrives[0])) return false;
-    for (int d = 1; d < 4; ++d) {
-        if (cfgDrives[d][0] && !disks[d].isOpen()) {
-            mountDrive(d, cfgDrives[d]);  // non-fatal if a 2nd drive fails
-        }
+  char path[96];
+  if (name[0] == '/') snprintf(path, sizeof(path), "%s", name);
+  else                snprintf(path, sizeof(path), "/%s", name);
+
+  img->close();
+  uint16_t tracks = 77;
+  uint8_t spt = 26;
+  uint16_t bytes = 128;
+
+  if (has_ext(path, ".hdd")) {
+    fs::File probe = SD_MMC.open(path, FILE_READ);
+    if (!probe) {
+      LOGE("mount %c: probe FAIL %s", 'A' + drive, path);
+      return false;
     }
+    size_t sz = probe.size();
+    probe.close();
+    uint32_t trks = sz / (26u * 128u);
+    if (trks < 1) trks = 1;
+    if (trks > 4095) trks = 4095;
+    tracks = (uint16_t)trks;
+    LOG("[hdd] %s size=%u -> %u trk x 26 x 128",
+        path, (unsigned)sz, tracks);
+  }
 
-    bios.resetState();
-    bios.installStubs(cpu.ram());
+  if (!img->open(path, tracks, spt, bytes, true)) {
+    LOGE("mount %c: FAIL %s", 'A' + drive, path);
+    return false;
+  }
 
-    uint8_t boot[128];
-    if (!disks[0].readSector(0, 1, boot)) { Serial.println("trk0 sec1 FAIL"); return false; }
-    cpu.loadProgram(0x0080, boot, sizeof(boot));
-    cpu.reset(0x0080);
-    return true;
+  bios.mount(drive, img);
+  LOG("%c: <- %s (%u trk x %u sec x %u byte)",
+      'A' + drive, path, img->tracks(),
+      img->sectorsPerTrack(), img->sectorBytes());
+  return true;
 }
 
-// -----------------------------------------------------------------------------
-static void z80Task(void* arg) {
-    Z80CPU* z = static_cast<Z80CPU*>(arg);
-    for (;;) {
-        z->runCycles(40000);     // ~10 ms at 4 MHz emulated
-        vTaskDelay(1);
+static bool mount_configured_drives() {
+  bool ok = true;
+  for (int d = 0; d < AltairBios::MAX_DRIVES; d++) {
+    const String* p = drive_config(d);
+    if (p->length() == 0) {
+      mount_drive(d, "");
+      continue;
     }
+    bool mounted = mount_drive(d, p->c_str());
+    if (!mounted && d == boot_slot()) ok = false;
+  }
+  return ok;
 }
 
-static void z80Suspend() {
-    if (z80TaskHandle && z80Running) {
-        vTaskSuspend(z80TaskHandle);
-        z80Running = false;
+static void inject_boot_text() {
+  if (!rxStream || cfg.boot_input_len == 0) return;
+  size_t sent = xStreamBufferSend(rxStream, cfg.boot_input, cfg.boot_input_len, 0);
+  LOG("Injected %u/%u boot_text byte(s) into Z80 console input",
+      (unsigned)sent, (unsigned)cfg.boot_input_len);
+}
+
+static void apply_console_terminal_mode() {
+  ConsoleTerminalMode mode = cfg.terminal.equalsIgnoreCase("adm3a")
+                           ? CONSOLE_TERM_ADM3A
+                           : CONSOLE_TERM_VT100;
+  console_set_terminal_mode(mode);
+  LOG("Console terminal mode: %s", mode == CONSOLE_TERM_ADM3A ? "adm3a" : "vt100");
+}
+
+static bool cold_boot_cpm() {
+  if (!sd_ok) {
+    LOGE("Cannot boot Z80: SD not mounted");
+    return false;
+  }
+  if (!mount_configured_drives()) return false;
+
+  int bs = boot_slot();
+  if (!disks[bs].isOpen()) {
+    LOGE("Boot drive %c: is not mounted", 'A' + bs);
+    return false;
+  }
+
+  LOG("Boot disk %c: %s", 'A' + bs, disks[bs].path());
+
+  bios.resetState();
+  bios.installStubs(cpu.ram());
+
+  uint8_t boot[128];
+  if (!disks[bs].readSector(0, 1, boot)) {
+    LOGE("Boot read failed: %s trk0 sec1", disks[bs].path());
+    return false;
+  }
+
+  cpu.loadProgram(0x0080, boot, sizeof(boot));
+  cpu.reset(0x0080);
+  inject_boot_text();
+  console_init();
+  apply_console_terminal_mode();
+  console_force_redraw();
+  g_boot_ok = true;
+  return true;
+}
+
+static void reboot_z80() {
+  LOG("Reboot Z80");
+  g_boot_ok = false;
+  console_init();
+  apply_console_terminal_mode();
+  console_force_redraw();
+  xStreamBufferReset(txStream);
+  xStreamBufferReset(rxStream);
+  cold_boot_cpm();
+}
+
+static void enqueue_input(uint8_t c) {
+  if (rxStream) xStreamBufferSend(rxStream, &c, 1, 0);
+}
+
+static void drain_telnet_input() {
+  uint8_t b;
+  while (telnet_in_pop(&b)) enqueue_input(b);
+}
+
+static void drain_z80_output() {
+  uint8_t b;
+  int budget = 768;
+  while (budget-- > 0 && xStreamBufferReceive(txStream, &b, 1, 0) == 1) {
+    console_feed(b);
+    telnet_write(b);
+    Serial.write(b);
+  }
+}
+
+static void draw_status_bar() {
+  static uint32_t prev_cycles = 0;
+  static uint32_t prev_ms = 0;
+  const int sy = CON_ROWS * CELL_H;
+
+  tft.drawFastHLine(0, sy, TFT_W, TFT_DARKGREY);
+
+  for (int d = 0; d < AltairBios::MAX_DRIVES; d++) {
+    uint16_t col = disks[d].isOpen() ? TFT_GREEN : 0x2945;
+    int bx = 6 + d * 32;
+    tft.fillRoundRect(bx, sy + 5, 28, 16, 2, col);
+    tft.setTextColor(TFT_BLACK, col);
+    tft.setTextDatum(MC_DATUM);
+    char lbl[3] = { (char)('A' + d), ':', 0 };
+    tft.drawString(lbl, bx + 14, sy + 13, 1);
+  }
+  tft.setTextDatum(TL_DATUM);
+
+  auto draw_pill = [&](int bx, const char* label, uint16_t col) {
+    tft.fillRoundRect(bx, sy + 5, 30, 16, 2, col);
+    tft.setTextColor(TFT_BLACK, col);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(label, bx + 15, sy + 13, 1);
+    tft.setTextDatum(TL_DATUM);
+  };
+
+  const uint16_t col_off = 0x2945;
+  uint16_t tel_col = !telnet_listening() ? col_off
+                   : telnet_connected() ? TFT_YELLOW : TFT_GREEN;
+  uint16_t ftp_col = !ftp_listening() ? col_off
+                   : ftp_connected() ? TFT_YELLOW : TFT_GREEN;
+  draw_pill(138, "TEL", tel_col);
+  draw_pill(172, "FTP", ftp_col);
+
+  uint32_t now = millis();
+  uint32_t cycles = g_last_cycles;
+  float mhz = 0.0f;
+  if (prev_ms && now > prev_ms && cycles >= prev_cycles)
+    mhz = (float)(cycles - prev_cycles) / (float)(now - prev_ms) / 1000.0f;
+  prev_cycles = cycles;
+  prev_ms = now;
+
+  tft.fillRect(206, sy + 1, TFT_W - 206, TFT_H - sy - 1, TFT_BLACK);
+  tft.setTextColor(WiFi.status() == WL_CONNECTED ? TFT_WHITE : TFT_YELLOW, TFT_BLACK);
+  tft.drawString(WiFi.status() == WL_CONNECTED
+                   ? WiFi.localIP().toString().c_str()
+                   : "not connected",
+                 208, sy + 5, 1);
+  char line[32];
+  snprintf(line, sizeof(line), "%.2f MHz", mhz);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString(line, 208, sy + 22, 1);
+
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString(cfg.title.c_str(), 6, sy + 22, 1);
+}
+
+static void ui_open_locked() {
+  xSemaphoreTake(g_ui_mutex, portMAX_DELAY);
+  ui_open();
+  xSemaphoreGive(g_ui_mutex);
+}
+
+static void ui_tap_locked(int x, int y) {
+  xSemaphoreTake(g_ui_mutex, portMAX_DELAY);
+  ui_handle_tap(x, y);
+  xSemaphoreGive(g_ui_mutex);
+}
+
+static void keyboard_open() {
+  keyboard.open();
+  g_keyboard_open = true;
+}
+
+static void keyboard_close() {
+  keyboard.close();
+  g_keyboard_open = false;
+  console_force_redraw();
+}
+
+static void render_task(void* arg) {
+  (void)arg;
+  bool was_open = false;
+  bool was_keyboard = false;
+  uint32_t status_ms = 0;
+  for (;;) {
+    bool open = ui_is_open();
+    bool kbd = g_keyboard_open;
+    if ((was_open && !open) || (was_keyboard && !kbd)) {
+      tft.fillRect(0, CON_ROWS * CELL_H, TFT_W, TFT_H - CON_ROWS * CELL_H, TFT_BLACK);
+      tft.fillRect(0, KeyboardModal::KBD_Y0, TFT_W, KeyboardModal::KBD_H, TFT_BLACK);
+      console_force_redraw();
+      status_ms = 0;
     }
-}
+    was_open = open;
+    was_keyboard = kbd;
 
-static void z80Resume() {
-    if (z80TaskHandle && !z80Running) {
-        vTaskResume(z80TaskHandle);
-        z80Running = true;
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Button action handlers
-// -----------------------------------------------------------------------------
-static void doBoot() {
-    z80Suspend();
-    console.clear();
-    console.render();
-    coldBootCpm();
-    // drain any stale serial/telnet input so old keystrokes don't hit the BIOS
-    xStreamBufferReset(rxStream);
-    xStreamBufferReset(txStream);
-    z80Resume();
-}
-
-static void doScroll() {
-    touchPanel.advanceScroll();
-    console.setView(TouchPanel::scrollColFor(touchPanel.scrollIndex()));
-    console.markAllDirty();
-}
-
-// Toggle the on-screen keyboard. When open, the console viewport shrinks
-// to the last 6 buffer rows (so the cursor stays visible above the
-// keyboard); when closed, it restores to full 24 rows.
-static void doKbdToggle() {
-    if (kbdOpen) {
-        kbdModal.close();
-        kbdOpen = false;
-        console.setViewRowSpan(0, Console::ROWS);
-        // Wipe the keyboard area; renderer will repaint console rows over it.
-        lcd.fillRect(0, KeyboardModal::KBD_Y0, 320, KeyboardModal::KBD_H, TFT_BLACK);
-        console.render();
+    if (open) {
+      xSemaphoreTake(g_ui_mutex, portMAX_DELAY);
+      ui_draw(tft);
+      xSemaphoreGive(g_ui_mutex);
     } else {
-        console.setViewRowSpan(Console::ROWS - 6, 6);
-        // Wipe the now-hidden console rows below the visible 6-row strip
-        // so stale glyphs don't bleed through edges of the keyboard area.
-        lcd.fillRect(0, Console::Y_ORIGIN + 6 * Console::CELL_H,
-                     320, KeyboardModal::KBD_Y0 - (Console::Y_ORIGIN + 6 * Console::CELL_H),
-                     TFT_BLACK);
-        kbdModal.open(&lcd);
-        kbdOpen = true;
+      drain_z80_output();
+      console_render(tft);
+      if (kbd) {
+        xSemaphoreTake(g_ui_mutex, portMAX_DELAY);
+        keyboard.draw(tft);
+        xSemaphoreGive(g_ui_mutex);
+      } else {
+        uint32_t now = millis();
+        if (now - status_ms >= 500) {
+          status_ms = now;
+          draw_status_bar();
+        }
+      }
     }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
 }
 
-static void handleMount() {
-    z80Suspend();
-    mountModal.open(&lcd);
-    MountModal::Result r;
-    while ((r = mountModal.poll()) == MountModal::Result::CONTINUE) {
-        delay(15);
-    }
-
-    uint8_t d = mountModal.drive();
-    if (r == MountModal::Result::OK && mountModal.filename()) {
-        mountDrive(d, mountModal.filename());
-    } else if (r == MountModal::Result::UNMOUNT) {
-        mountDrive(d, nullptr);
-    }
-    mountModal.close();
-
-    // Redraw main UI.
-    lcd.fillScreen(TFT_BLACK);
-    touchPanel.render();
-    console.markAllDirty();
-    console.render();
-    z80Resume();
+static void net_task(void* arg) {
+  (void)arg;
+  for (;;) {
+    telnet_poll();
+    ftp_poll();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
 }
 
-static void handleSetup() {
-    z80Suspend();
-    setupModal.open(&lcd);
-    SetupModal::Result r;
-    while ((r = setupModal.poll()) == SetupModal::Result::CONTINUE) {
-        delay(15);
+static void z80_task(void* arg) {
+  (void)arg;
+  for (;;) {
+    if (z80_running && !ui_is_open() && g_boot_ok) {
+      cpu.runCycles(40000);
+      g_last_cycles = cpu.cpu()->cyc;
     }
-    setupModal.close();
-
-    // Redraw the main UI before dispatching, so any handler that further
-    // suspends/redraws starts from a clean state.
-    lcd.fillScreen(TFT_BLACK);
-    touchPanel.render();
-    console.markAllDirty();
-    console.render();
-
-    switch (r) {
-    case SetupModal::Result::REBOOT:
-        // doBoot suspends Z80 itself; we already did, so just call it
-        // — the Resume will be paired correctly inside doBoot.
-        z80Resume();   // pair our suspend; doBoot does its own pair
-        doBoot();
-        return;
-    case SetupModal::Result::MOUNT:
-        z80Resume();
-        handleMount();
-        return;
-    case SetupModal::Result::CLEAR:
-        console.clear();
-        console.render();
-        break;
-    case SetupModal::Result::CANCEL:
-    default:
-        break;
-    }
-    z80Resume();
-}
-
-// -----------------------------------------------------------------------------
-// Serial -> Z80 rx bridge. Useful for debugging via the USB serial port;
-// the production input path is telnet over WiFi (BT input was removed —
-// see top-of-file note). Arduino Serial Monitor "Newline" sends LF; CP/M
-// wants CR, so remap.
-// -----------------------------------------------------------------------------
-static void drainSerialToZ80() {
-    while (Serial.available() > 0) {
-        int c = Serial.read();
-        if (c < 0) break;
-        if (c == '\n') c = '\r';
-        uint8_t b = (uint8_t)c;
-        xStreamBufferSend(rxStream, &b, 1, 0);
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Physical BOOT button on the ESP32 module is GPIO0 (active LOW, pull-up).
-// It's a strapping pin, so it can't be held at reset (ROM would enter
-// download mode). Instead, poll it at runtime: pressing BOOT while the
-// sketch is running triggers touch recalibration.
-static const uint8_t PIN_BOOT_BUTTON = 0;
-static uint32_t      nextBootPoll_ms = 0;
-static bool          prevBootLow     = false;
-
-static void runCalibration() {
-    z80Suspend();
-    Serial.println("[touch] BOOT pressed -> recalibration");
-    lcd.fillScreen(TFT_BLACK);
-    touchPanel.calibrateAndSave();
-    lcd.fillScreen(TFT_BLACK);
-    touchPanel.render();
-    console.markAllDirty();
-    console.render();
-    z80Resume();
-}
-
-static void pollBootButton() {
-    uint32_t now = millis();
-    if ((int32_t)(now - nextBootPoll_ms) < 0) return;
-    nextBootPoll_ms = now + 1000;  // ~1 Hz
-
-    bool low = (digitalRead(PIN_BOOT_BUTTON) == LOW);
-    if (low && !prevBootLow) runCalibration();
-    prevBootLow = low;
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
 }
 
 void setup() {
-    Serial.begin(115200);
-    delay(100);
-    Serial.printf("\n=== vZ80 v%s (%s) booting ===\n",
-                  VZ80_VERSION, VZ80_BUILD_DATE);
-    Serial.println("press BOOT at any time to recalibrate touch");
+  delay(200);
+  Serial.begin(115200);
+  for (int i = 0; i < 3; i++) {
+    delay(1000);
+    Serial.println(i);
+  }
+  Serial.println();
+  LOG("%s %s build %s", APP_TITLE, APP_VERSION, APP_BUILD_DATE);
 
-    pinMode(PIN_BOOT_BUTTON, INPUT_PULLUP);
+  strip.begin();
+  strip.setBrightness(20);
+  led(32, 0, 0);
 
-    lcd.init();
-    lcd.setBrightness(200);
-    lcd.setRotation(3);
-    lcd.fillScreen(TFT_BLACK);
+  tft.init();
+  tft.setRotation(1);
+  tft_banner();
 
-    if (!initSD()) fatal("NO SD");
-    Serial.printf("SD %llu MB\n", SD.cardSize() / (1024ULL * 1024ULL));
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%u KB", (unsigned)(ESP.getPsramSize() / 1024));
+  tft_status(ROW_PSRAM, "PSRAM: ", buf, ESP.getPsramSize() ? TFT_GREEN : TFT_RED);
+  tft_status(ROW_SD,    "SD:    ", "(pending)", TFT_DARKGREY);
+  tft_status(ROW_CFG,   "Cfg:   ", "(pending)", TFT_DARKGREY);
+  tft_status(ROW_WIFI,  "WiFi:  ", "(pending)", TFT_DARKGREY);
+  tft_status(ROW_IP,    "IP:    ", "(none)", TFT_DARKGREY);
+  tft_status(ROW_CPU,   "CPU:   ", "(pending)", TFT_DARKGREY);
 
-    if (!console.begin(&lcd, TFT_GREEN, TFT_BLACK)) fatal("CONSOLE");
-    console.puts("vZ80 M5 - booting CP/M ...\n");
-    console.render();
+  txStream = xStreamBufferCreate(4096, 1);
+  rxStream = xStreamBufferCreate(512, 1);
+  if (!txStream || !rxStream) {
+    tft_status(ROW_CPU, "CPU:   ", "stream alloc FAILED", TFT_RED);
+    LOGE("Stream buffer allocation failed");
+    return;
+  }
 
-    // Stream sizes: rxStream is large enough to absorb a multi-KB telnet
-    // paste without dropping bytes (telnet stops draining TCP when rxStream
-    // is near-full so TCP-window backpressure throttles the sender).
-    // txStream is sized for typical Z80 bursts; the SIO status port reports
-    // "tx busy" when it fills, so the Z80 busy-waits instead of losing bytes.
-    txStream = xStreamBufferCreate(1024, 1);
-    rxStream = xStreamBufferCreate(4096, 1);
-    if (!txStream || !rxStream) fatal("STREAMS");
+  tft_status(ROW_CPU, "CPU:   ", "init...", TFT_YELLOW);
+  cpu.begin(txStream, rxStream);
+  cpu.setBios(&bios);
+  if (!cpu.ram()) {
+    tft_status(ROW_CPU, "CPU:   ", "RAM alloc FAILED", TFT_RED);
+    LOGE("Z80 RAM allocation failed");
+    return;
+  }
+  tft_status(ROW_CPU, "CPU:   ", "Z80 ready", TFT_GREEN);
 
-    cpu.begin(txStream, rxStream);
-    cpu.setBios(&bios);
+  sd_and_config_init();
+  wifi_connect();
 
-    if (!loadConfig())  fatal("CONFIG");
-    if (!coldBootCpm()) fatal("BOOT");
+  telnet_begin(cfg.telnet_port, cfg.telnet_enabled);
+  ftp_begin(cfg.ftp_port, cfg.ftp_enabled, cfg.ftp_user.c_str(), cfg.ftp_password.c_str());
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  touch_init();
+  ui_init();
+  console_init();
+  apply_console_terminal_mode();
 
-    if (!touchPanel.begin(&lcd)) fatal("TOUCH");
-    touchPanel.setTitle(cfgAppName);
-    setupModal.setVersion(VZ80_VERSION, VZ80_BUILD_DATE);
+  g_ui_mutex = xSemaphoreCreateMutex();
+  if (!g_ui_mutex) {
+    tft_status(ROW_CPU, "CPU:   ", "mutex FAILED", TFT_RED);
+    return;
+  }
 
-    // M7: WiFi + telnet + FTP. Empty SSID disables the lot. Both telnet
-    // listener and FTP server are started in loop() once STA_GOT_IP fires
-    // (WiFiServer.begin() asserts inside lwIP if WiFi isn't initialized,
-    // and FTP touches SD which the system event task must not).
-    WifiSta::setCallbacks(onWifiConnected, onWifiDisconnected);
-    if (cfgWifiSsid[0]) {
-        WifiSta::begin(cfgWifiSsid, cfgWifiPass);
-    } else {
-        console.puts("[net] WiFi disabled (no ssid in config.json)\n");
-        console.render();
-    }
+  bool booted = cold_boot_cpm();
+  tft_status(ROW_CPU, "CPU:   ", booted ? "booting CP/M" : "boot FAILED",
+             booted ? TFT_GREEN : TFT_RED);
+  z80_running = booted;
+  led(booted ? 0 : 32, booted ? 0 : 0, booted ? 32 : 0);
 
-    // Pin Z80 to core 1 (shares with Arduino loop/UI) and reserve core 0
-    // for WiFi/lwIP. (BT removed — see top-of-file note.)
-    BaseType_t ok = xTaskCreatePinnedToCore(
-        z80Task, "z80", 8192, &cpu, 1, &z80TaskHandle, 1);
-    if (ok != pdPASS) fatal("Z80 TASK");
-    z80Running = true;
-
-    Serial.printf("[heap] post-setup free=%u  largest=%u\n",
-        (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
-    Serial.println("core0=WiFi/lwIP  core1=Z80+UI/display");
+  xTaskCreatePinnedToCore(render_task, "render", 10240, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(net_task,    "net",     8192, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(z80_task,    "z80",     8192, NULL, 3, NULL, 1);
 }
 
-// -----------------------------------------------------------------------------
 void loop() {
-    pollBootButton();
-    drainSerialToZ80();
+  static bool btn_prev = true;
+  static uint32_t last_tap = 0;
+  static uint32_t wifi_ms = 0;
+  static bool prompt_seen = false;
 
-    // Deferred network bring-up/tear-down (flagged by WiFi event task).
-    if (netStartupPending_) {
-        netStartupPending_ = false;
-        char msg[64];
-        snprintf(msg, sizeof(msg), "[net] WiFi up: %s\n",
-                 WifiSta::localIP().toString().c_str());
-        console.puts(msg);
-        console.render();
-        if (cfgTelnetEnabled) gTelnet.begin(cfgTelnetPort, rxStream);
-        if (cfgFtpEnabled)    Ftp::begin(cfgFtpUser, cfgFtpPass);
-
-        // WiFi association burst can leave the LCD in a bad state (SPI
-        // bus is shared with SD via bus_shared=true). Re-init and redraw
-        // to recover from any garbled commands the panel ingested.
-        lcd.init();
-        lcd.setRotation(3);
-        lcd.setBrightness(200);
-        lcd.fillScreen(TFT_BLACK);
-        touchPanel.render();
-        console.markAllDirty();
-        console.render();
+  int tx, ty;
+  if (touch_poll(&tx, &ty)) {
+    if (g_keyboard_open) {
+      uint8_t b = 0;
+      xSemaphoreTake(g_ui_mutex, portMAX_DELAY);
+      KeyboardModal::Result kr = keyboard.handleTap(tx, ty, &b);
+      xSemaphoreGive(g_ui_mutex);
+      if (kr == KeyboardModal::Result::KEY) enqueue_input(b);
+      else if (kr == KeyboardModal::Result::CLOSE) keyboard_close();
+    } else if (ui_is_open()) {
+      ui_tap_locked(tx, ty);
+    } else {
+      uint32_t now = millis();
+      if (now - last_tap < 450) { ui_open_locked(); last_tap = 0; }
+      else last_tap = now;
     }
-    if (netTeardownPending_) {
-        netTeardownPending_ = false;
-        gTelnet.disconnect();
-        Ftp::stop();
-        console.puts("[net] WiFi down\n");
-        console.render();
+  }
+
+  bool btn_now = digitalRead(BUTTON_PIN);
+  if (btn_prev && !btn_now && !ui_is_open()) {
+    if (g_keyboard_open) keyboard_close();
+    else ui_open_locked();
+  }
+  btn_prev = btn_now;
+
+  if (ui_consume_reboot()) {
+    if (g_keyboard_open) keyboard_close();
+    reboot_z80();
+    prompt_seen = false;
+    led(0, 0, 32);
+  }
+  if (ui_consume_esp_restart()) {
+    LOG("ui: reset ESP32");
+    delay(50);
+    ESP.restart();
+  }
+  if (ui_consume_keyboard()) keyboard_open();
+
+  while (Serial.available())
+    enqueue_input((uint8_t)Serial.read());
+  drain_telnet_input();
+
+  uint32_t now = millis();
+  if (now - wifi_ms >= 10000) {
+    wifi_ms = now;
+    if (cfg.wifi_ssid.length() && WiFi.status() != WL_CONNECTED) {
+      LOGE("WiFi link down - reconnecting");
+      WiFi.reconnect();
     }
+  }
 
-    gTelnet.tick();
+  if (!prompt_seen && console_feed_count() > 0 &&
+      millis() - console_last_feed_ms() > 800) {
+    prompt_seen = true;
+    led(0, 32, 0);
+  }
 
-    // RGB LED: off when WiFi disconnected; steady green when WiFi up;
-    // 2 Hz green blink when a telnet client is also connected. Bit
-    // layout per RgbLed::Set: bit2=R, bit1=G, bit0=B (the RGBCOLOR_*
-    // macros in the driver header are labeled wrong, so we use raw
-    // values — green = 0b010).
-    static uint32_t nextLed_ms = 0;
-    static bool     ledBlinkOn = false;
-    if ((int32_t)(millis() - nextLed_ms) >= 0) {
-        nextLed_ms = millis() + 250;          // 4 Hz tick = 2 Hz blink
-        bool wifiUp = WifiSta::connected();
-        bool telUp  = gTelnet.clientConnected();
-        if (!wifiUp) {
-            rgbLed.Set(0);                    // off
-        } else if (telUp) {
-            ledBlinkOn = !ledBlinkOn;
-            rgbLed.Set(ledBlinkOn ? 0b010 : 0);  // green / off
-        } else {
-            rgbLed.Set(0b010);                // steady green
-            ledBlinkOn = false;
-        }
-    }
-
-    // Refresh top-strip status (wifi line + telnet line) once a second.
-    static uint32_t nextNetStatus_ms = 0;
-    if ((int32_t)(millis() - nextNetStatus_ms) >= 0) {
-        nextNetStatus_ms = millis() + 1000;
-        char wline[40];
-        char bline[40];
-
-        // Line 1: WiFi
-        if (!cfgWifiSsid[0]) {
-            snprintf(wline, sizeof(wline), "wifi: off");
-        } else if (!WifiSta::connected()) {
-            snprintf(wline, sizeof(wline), "wifi: %s ...", cfgWifiSsid);
-        } else {
-            snprintf(wline, sizeof(wline), "wifi: %s",
-                     WifiSta::localIP().toString().c_str());
-        }
-
-        // Line 2: telnet client (BT removed — see top-of-file note).
-        if (!cfgTelnetEnabled) {
-            snprintf(bline, sizeof(bline), "tel:off");
-        } else if (gTelnet.clientConnected()) {
-            snprintf(bline, sizeof(bline), "tel:%s",
-                     gTelnet.clientIP().toString().c_str());
-        } else {
-            snprintf(bline, sizeof(bline), "tel:.");
-        }
-
-        touchPanel.setStatus(wline, bline);
-    }
-
-    // Z80 -> console (display + serial echo + telnet client).
-    uint8_t chunk[64];
-    size_t n = xStreamBufferReceive(txStream, chunk, sizeof(chunk), 0);
-    if (n > 0) {
-        for (size_t i = 0; i < n; ++i) {
-            console.putc((char)chunk[i]);
-            Serial.write(chunk[i]);
-        }
-        gTelnet.writeBytes(chunk, n);
-    }
-    console.render();
-
-    // Touch panel actions.
-    switch (touchPanel.poll()) {
-        case TouchPanel::Action::SETUP:  handleSetup();   break;
-        case TouchPanel::Action::KBD:    doKbdToggle();   break;
-        case TouchPanel::Action::SCROLL: doScroll();      break;
-        case TouchPanel::Action::NONE:   break;
-    }
-
-    // On-screen keyboard input (when open). Each tap sends one byte
-    // into the same rxStream that telnet/serial use.
-    if (kbdOpen) {
-        if (kbdModal.poll() == KeyboardModal::Result::KEY) {
-            uint8_t b = kbdModal.lastByte();
-            xStreamBufferSend(rxStream, &b, 1, 0);
-        }
-    }
-
-    delay(10);
+  delay(1);
 }
