@@ -1,6 +1,6 @@
 // board: esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi
 // vZ80 - Z80 / CP/M emulator on Freenove ESP32-S3 2.8" Display
-// Dean Gienger and Codex and Claude, 9 Jun 2026
+// Dean Gienger and Codex and Claude, 10 Jun 2026
 // Boots up a version of cpm2.2 from Altair, 48k version from floppy disk
 // ESP32S3 Dev Module board, 16Mb Flash, 8Mb PSRAM, 2.8" dispay with capacitive touch screen
 // Partition: 16M flash (3Mb app/9.9Mb SPIFAT)
@@ -156,12 +156,6 @@ static int boot_slot() {
   }
 }
 
-static bool has_ext(const char* path, const char* ext) {
-  size_t n = strlen(path);
-  size_t e = strlen(ext);
-  return n >= e && strcasecmp(path + n - e, ext) == 0;
-}
-
 static const String* drive_config(int d) {
   switch (d) {
     case 0: return &cfg.disk_a;
@@ -190,22 +184,6 @@ static bool mount_drive(uint8_t drive, const char* name) {
   uint16_t tracks = 77;
   uint8_t spt = 26;
   uint16_t bytes = 128;
-
-  if (has_ext(path, ".hdd")) {
-    fs::File probe = SD_MMC.open(path, FILE_READ);
-    if (!probe) {
-      LOGE("mount %c: probe FAIL %s", 'A' + drive, path);
-      return false;
-    }
-    size_t sz = probe.size();
-    probe.close();
-    uint32_t trks = sz / (26u * 128u);
-    if (trks < 1) trks = 1;
-    if (trks > 4095) trks = 4095;
-    tracks = (uint16_t)trks;
-    LOG("[hdd] %s size=%u -> %u trk x 26 x 128",
-        path, (unsigned)sz, tracks);
-  }
 
   if (!img->open(path, tracks, spt, bytes, true)) {
     LOGE("mount %c: FAIL %s", 'A' + drive, path);

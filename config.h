@@ -2,8 +2,8 @@
 
 // ---- App metadata ----
 #define APP_TITLE       "vZ80"
-#define APP_VERSION     "V2.0"
-#define APP_BUILD_DATE  "2026-06-09"
+#define APP_VERSION     "V2.1"
+#define APP_BUILD_DATE  "2026-06-10"
 
 // ---- RGB LED (WS2812) ----
 #define LED_PIN         42
@@ -49,16 +49,6 @@
 #define FTP_PORT        21
 #define FTP_DEFAULT_USER "cpm"
 #define FTP_DEFAULT_PASS "cpm"
-
-// ---- Disk geometries ----
-#define FD_BYTES        1474560UL          // 80 x 2 x 18 x 512
-#define FD_CYL          80
-#define FD_HEADS        2
-#define FD_SEC          18
-#define HD_BYTES        33554432UL         // 1024 x 4 x 16 x 512 = exact 32 MB
-#define HD_CYL          1024
-#define HD_HEADS        4
-#define HD_SEC          16
 
 // ---- Boot tuning ----
 #define WIFI_CONNECT_TIMEOUT_MS  20000

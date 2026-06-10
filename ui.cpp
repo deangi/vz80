@@ -24,10 +24,13 @@
 #define COL_DANGER   0xC000
 
 #define MENU_VISIBLE 4
-#define ITEM_Y0      26
-#define ITEM_H       44
-#define NAV_Y        204
-#define MENU_HIT_Y_BIAS 6
+#define Htb          26
+#define Hmb          30
+#define Hbt          30
+#define Hspc         6
+#define ITEM_Y0      (Htb + Hspc)
+#define ITEM_H       (Hmb + Hspc)
+#define NAV_Y        (TFT_H - Hbt)
 
 #define HIT_NONE -1
 #define HIT_BACK -2
@@ -94,9 +97,7 @@ static String* mutable_drive_path(int d) {
 
 static bool supported_disk_ext(const char* base) {
   const char* dot = strrchr(base, '.');
-  return dot && (!strcasecmp(dot, ".dsk") ||
-                 !strcasecmp(dot, ".hdd") ||
-                 !strcasecmp(dot, ".img"));
+  return dot && !strcasecmp(dot, ".dsk");
 }
 
 static void scan_disk_files() {
@@ -230,9 +231,12 @@ static void go(Screen s) {
 void ui_open() { go(SC_MAIN); }
 
 static int list_hit(int x, int y) {
-  int hy = y + MENU_HIT_Y_BIAS;
-  if (hy >= ITEM_Y0 && hy < ITEM_Y0 + MENU_VISIBLE * ITEM_H && x >= 6 && x < 314)
-    return (hy - ITEM_Y0) / ITEM_H;
+  const int hit_y0 = ITEM_Y0 - Hspc / 2;
+  const int hit_y1 = hit_y0 + MENU_VISIBLE * ITEM_H;
+  if (y >= hit_y0 && y < hit_y1 && x >= 6 && x < 314) {
+    int slot = (y - hit_y0) / ITEM_H;
+    return slot;
+  }
   if (y >= NAV_Y) {
     if (g_count > MENU_VISIBLE) {
       if (x < 156) return HIT_BACK;
@@ -308,7 +312,8 @@ static void activate(int idx) {
         bool ok = g_drive_mount_fn ? g_drive_mount_fn((uint8_t)g_sel, "") : false;
         if (ok) *mutable_drive_path(g_sel) = "";
         LOG("ui: dismount %s: %s", DRIVE_NAMES[g_sel], ok ? "ok" : "FAIL");
-        go(SC_DRIVES);
+        if (ok) { g_reboot = true; go(SC_DRIVES); }
+        else go(SC_DRIVES);
       }
       break;
     case SC_DISK_PICKER:
@@ -318,7 +323,8 @@ static void activate(int idx) {
         bool ok = g_drive_mount_fn ? g_drive_mount_fn((uint8_t)g_sel, path) : false;
         if (ok) *mutable_drive_path(g_sel) = path;
         LOG("ui: mount %s: %s -> %s", DRIVE_NAMES[g_sel], path, ok ? "ok" : "FAIL");
-        go(SC_DRIVES);
+        if (ok) { g_reboot = true; go(SC_DRIVES); }
+        else go(SC_DRIVES);
       }
       break;
     case SC_WIFI_PICKER:
@@ -377,26 +383,26 @@ static void draw_item(TFT_eSPI& tft, int slot, int idx) {
   if (g_screen == SC_DRIVES && idx >= 0 && idx < 4 && drive_path(idx)->length()) bg = COL_ITEM_HI;
   if (g_screen == SC_CONFIRM_RESET && idx == 0) bg = COL_DANGER;
 
-  tft.fillRoundRect(6, y + 3, 308, ITEM_H - 6, 4, bg);
+  tft.fillRoundRect(6, y, 308, Hmb, 4, bg);
   tft.setTextColor(COL_TEXT, bg);
   tft.setTextDatum(ML_DATUM);
-  tft.drawString(g_items[idx], 18, y + ITEM_H / 2, 2);
+  tft.drawString(g_items[idx], 18, y + Hmb / 2, 2);
   tft.setTextDatum(TL_DATUM);
 }
 
 static void draw_nav(TFT_eSPI& tft) {
   tft.fillRect(0, NAV_Y, TFT_W, TFT_H - NAV_Y, COL_BG);
-  tft.fillRoundRect(6, NAV_Y + 4, 144, 28, 4, COL_TITLE);
+  tft.fillRoundRect(6, NAV_Y, 144, Hbt, 4, COL_TITLE);
   tft.setTextColor(TFT_WHITE, COL_TITLE);
   tft.setTextDatum(MC_DATUM);
-  tft.drawString("Back", 78, NAV_Y + 18, 2);
+  tft.drawString("Back", 78, NAV_Y + Hbt / 2, 2);
 
   if (g_count > MENU_VISIBLE) {
-    tft.fillRoundRect(160, NAV_Y + 4, 72, 28, 4, g_scroll > 0 ? COL_TITLE : COL_ITEM);
-    tft.drawString("Up", 196, NAV_Y + 18, 2);
-    tft.fillRoundRect(242, NAV_Y + 4, 72, 28, 4,
+    tft.fillRoundRect(160, NAV_Y, 72, Hbt, 4, g_scroll > 0 ? COL_TITLE : COL_ITEM);
+    tft.drawString("Up", 196, NAV_Y + Hbt / 2, 2);
+    tft.fillRoundRect(242, NAV_Y, 72, Hbt, 4,
                       g_scroll + MENU_VISIBLE < g_count ? COL_TITLE : COL_ITEM);
-    tft.drawString("Down", 278, NAV_Y + 18, 2);
+    tft.drawString("Down", 278, NAV_Y + Hbt / 2, 2);
   }
   tft.setTextDatum(TL_DATUM);
 }

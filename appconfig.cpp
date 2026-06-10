@@ -359,7 +359,8 @@ bool config_write_default_vz80(const AppConfig& cfg) {
   f.printf("boot_text = \"%s\"\r\n", escaped_bytes(cfg.boot_input, cfg.boot_input_len).c_str());
   f.println();
   f.println("[disks]");
-  f.println("; a, b = CP/M floppy images. c, d = optional CP/M hard-disk images.");
+  f.println("; a, b, c, d = standard CP/M floppy disk images.");
+  f.println("; Hard-disk images are not supported in this version.");
   f.println("; Leave a slot blank to dismount it at boot.");
   f.printf("a    = %s\r\n", cfg.disk_a.c_str());
   f.printf("b    = %s\r\n", cfg.disk_b.c_str());

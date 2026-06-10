@@ -42,3 +42,7 @@ the earlier CYD sketch is not used in this version.
 
 Example SD-card config files live in `Z80SdCard/`. Disk images are intentionally
 ignored by Git; copy the required CP/M disk images to the SD card separately.
+
+This version supports standard CP/M floppy disk images only. Hard-disk image
+support is deferred until the CP/M BIOS/DPB geometry is updated to describe
+larger drives to the guest OS.
