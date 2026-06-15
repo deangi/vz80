@@ -1,8 +1,10 @@
 #include "disk_image.h"
+#include "../../SD_FTP_Server/src/SD_FTP_Server.h"
 #include <string.h>
 
 bool DiskImage::open(const char* path, uint16_t tracks, uint8_t spt,
                      uint16_t bytes, bool writable) {
+    SD_FTP_StorageGuard guard;
     close();
     strncpy(path_, path, sizeof(path_) - 1);
     path_[sizeof(path_) - 1] = '\0';
@@ -27,12 +29,14 @@ bool DiskImage::open(const char* path, uint16_t tracks, uint8_t spt,
 }
 
 void DiskImage::close() {
+    SD_FTP_StorageGuard guard;
     if (file_) file_.close();
     tracks_ = 0;
     sectorsPerTrack_ = 0;
 }
 
 bool DiskImage::readSector(uint16_t track, uint8_t sector, uint8_t* buf) {
+    SD_FTP_StorageGuard guard;
     if (!file_) return false;
     if (track >= tracks_ || sector < 1 || sector > sectorsPerTrack_) return false;
     uint32_t off = offsetOf(track, sector);
@@ -41,6 +45,7 @@ bool DiskImage::readSector(uint16_t track, uint8_t sector, uint8_t* buf) {
 }
 
 bool DiskImage::writeSector(uint16_t track, uint8_t sector, const uint8_t* buf) {
+    SD_FTP_StorageGuard guard;
     if (!file_ || !writable_) return false;
     if (track >= tracks_ || sector < 1 || sector > sectorsPerTrack_) return false;
     uint32_t off = offsetOf(track, sector);

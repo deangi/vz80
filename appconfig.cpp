@@ -2,6 +2,7 @@
 #include "config.h"
 #include "platform.h"
 #include "secrets.h"
+#include "SD_FTP_Server/src/SD_FTP_Server.h"
 
 #include <SD_MMC.h>
 #include <string.h>
@@ -200,7 +201,10 @@ void config_apply_compiled_defaults(AppConfig& cfg) {
 
 // -------- parser --------
 
-static void parse_line(AppConfig& cfg, String& section, const String& raw) {
+enum ConfigDomain : uint8_t { CONFIG_NETWORK, CONFIG_EMULATOR };
+
+static void parse_line(AppConfig& cfg, String& section, const String& raw,
+                       ConfigDomain domain) {
   String t = trim(raw);
   if (t.length() == 0) return;
   if (t.startsWith(";") || t.startsWith("#")) return;
@@ -213,6 +217,9 @@ static void parse_line(AppConfig& cfg, String& section, const String& raw) {
 
   String key = to_lower(trim(t.substring(0, eq)));
   String val = strip_inline_comment(t.substring(eq + 1));
+
+  bool network_section = section == "wifi" || section == "telnet" || section == "ftp";
+  if ((domain == CONFIG_NETWORK) != network_section) return;
 
   if (section == "system") {
     if (key == "title") cfg.title = val;
@@ -242,13 +249,27 @@ static void parse_line(AppConfig& cfg, String& section, const String& raw) {
   }
 }
 
-static bool parse_config_file(AppConfig& cfg, const char* path) {
+static void recover_config_backup(const char* path) {
+  if (SD_MMC.exists(path)) return;
+  char backup[192];
+  if (snprintf(backup, sizeof(backup), "%s.bak", path) >= (int)sizeof(backup)) return;
+  if (SD_MMC.exists(backup)) {
+    if (SD_MMC.rename(backup, path))
+      LOG("Restored interrupted config update: %s", path);
+    else
+      LOGE("Could not restore config backup %s", backup);
+  }
+}
+
+static bool parse_config_file(AppConfig& cfg, const char* path, ConfigDomain domain) {
+  SD_FTP_StorageGuard guard;
+  recover_config_backup(path);
   File f = SD_MMC.open(path, FILE_READ);
   if (!f) return false;
   String section;
   while (f.available()) {
     String line = f.readStringUntil('\n');
-    parse_line(cfg, section, line);
+    parse_line(cfg, section, line, domain);
   }
   f.close();
   return true;
@@ -259,7 +280,7 @@ bool config_load_wifi(AppConfig& cfg) {
   cfg.wifi_password = "";
   cfg.wifi_hostname = "";
 
-  bool existed = parse_config_file(cfg, WIFI_CFG_PATH);
+  bool existed = parse_config_file(cfg, WIFI_CFG_PATH, CONFIG_NETWORK);
   if (!existed) {
     LOG("%s not found, writing defaults", WIFI_CFG_PATH);
     cfg.wifi_ssid     = WIFI_SSID;
@@ -288,7 +309,7 @@ bool config_load_vz80(AppConfig& cfg) {
   cfg.boot_input_len = 0;
   cfg.terminal = "vt100";
 
-  bool existed = parse_config_file(cfg, VZ80_CFG_PATH);
+  bool existed = parse_config_file(cfg, VZ80_CFG_PATH, CONFIG_EMULATOR);
   if (!existed) {
     LOG("%s not found, writing defaults", VZ80_CFG_PATH);
     cfg.title      = APP_TITLE;
@@ -311,6 +332,7 @@ bool config_load_vz80(AppConfig& cfg) {
 }
 
 bool config_write_default_wifi(const AppConfig& cfg) {
+  SD_FTP_StorageGuard guard;
   File f = SD_MMC.open(WIFI_CFG_PATH, FILE_WRITE);
   if (!f) { LOGE("Could not open %s for write", WIFI_CFG_PATH); return false; }
   f.println("; vZ80 network configuration");
@@ -341,6 +363,7 @@ bool config_write_default_wifi(const AppConfig& cfg) {
 }
 
 bool config_write_default_vz80(const AppConfig& cfg) {
+  SD_FTP_StorageGuard guard;
   File f = SD_MMC.open(VZ80_CFG_PATH, FILE_WRITE);
   if (!f) { LOGE("Could not open %s for write", VZ80_CFG_PATH); return false; }
   f.println("; vZ80 emulator configuration");
@@ -373,44 +396,73 @@ bool config_write_default_vz80(const AppConfig& cfg) {
 }
 
 bool config_copy_file(const char* src, const char* dst) {
+  SD_FTP_StorageGuard guard;
+  char temp[192];
+  char backup[192];
+  if (snprintf(temp, sizeof(temp), "%s.tmp", dst) >= (int)sizeof(temp) ||
+      snprintf(backup, sizeof(backup), "%s.bak", dst) >= (int)sizeof(backup)) {
+    LOGE("config_copy_file: destination path too long: %s", dst);
+    return false;
+  }
+
   File s = SD_MMC.open(src, FILE_READ);
   if (!s) { LOGE("config_copy_file: can't open %s", src); return false; }
   uint32_t srcSize = (uint32_t)s.size();
 
-  if (SD_MMC.exists(dst)) {
-    bool removed = SD_MMC.remove(dst);
-    LOG("config_copy_file: removed pre-existing %s (%s)", dst, removed ? "ok" : "FAILED");
-    if (!removed) { s.close(); return false; }
-  }
-
-  File d = SD_MMC.open(dst, FILE_WRITE);
-  if (!d) { LOGE("config_copy_file: can't open %s for write", dst); s.close(); return false; }
+  if (SD_MMC.exists(temp)) SD_MMC.remove(temp);
+  File d = SD_MMC.open(temp, FILE_WRITE);
+  if (!d) { LOGE("config_copy_file: can't open %s for write", temp); s.close(); return false; }
 
   uint8_t buf[512];
   size_t total = 0;
+  bool copy_ok = true;
   while (s.available()) {
     int n = s.read(buf, sizeof(buf));
-    if (n <= 0) break;
+    if (n <= 0) { copy_ok = false; break; }
     int w = d.write(buf, n);
     if (w != n) {
       LOGE("config_copy_file: short write (%d/%d) at %u", w, n, (unsigned)total);
-      s.close(); d.close();
-      return false;
+      copy_ok = false;
+      break;
     }
     total += n;
   }
   s.close();
+  d.flush();
   d.close();
 
-  File v = SD_MMC.open(dst, FILE_READ);
+  File v = SD_MMC.open(temp, FILE_READ);
   uint32_t verifySize = v ? (uint32_t)v.size() : 0;
   if (v) v.close();
-  LOG("config_copy_file: %s -> %s src=%u written=%u on-disk=%u",
-      src, dst, (unsigned)srcSize, (unsigned)total, (unsigned)verifySize);
-  return verifySize == srcSize;
+  if (!copy_ok || total != srcSize || verifySize != srcSize) {
+    LOGE("config_copy_file: temporary copy failed src=%u written=%u on-disk=%u",
+         (unsigned)srcSize, (unsigned)total, (unsigned)verifySize);
+    SD_MMC.remove(temp);
+    return false;
+  }
+
+  if (SD_MMC.exists(backup)) SD_MMC.remove(backup);
+  bool had_dst = SD_MMC.exists(dst);
+  if (had_dst && !SD_MMC.rename(dst, backup)) {
+    LOGE("config_copy_file: can't preserve %s as %s", dst, backup);
+    SD_MMC.remove(temp);
+    return false;
+  }
+  if (!SD_MMC.rename(temp, dst)) {
+    LOGE("config_copy_file: can't activate %s", dst);
+    if (had_dst && !SD_MMC.rename(backup, dst))
+      LOGE("config_copy_file: FAILED to restore %s from %s", dst, backup);
+    SD_MMC.remove(temp);
+    return false;
+  }
+  if (had_dst) SD_MMC.remove(backup);
+  LOG("config_copy_file: atomically replaced %s from %s (%u bytes)",
+      dst, src, (unsigned)srcSize);
+  return true;
 }
 
 int config_list_variants(const char* prefix, char names[][44], int max) {
+  SD_FTP_StorageGuard guard;
   if (max <= 0) return 0;
   int count = 0;
 
@@ -446,6 +498,7 @@ int config_list_variants(const char* prefix, char names[][44], int max) {
 
 bool ensure_disk_image(const char* path, uint32_t bytes,
                        bool create_if_missing, const char* label) {
+  SD_FTP_StorageGuard guard;
   if (!path || !*path) return false;
   if (SD_MMC.exists(path)) {
     File f = SD_MMC.open(path, FILE_READ);

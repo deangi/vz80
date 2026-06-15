@@ -10,6 +10,11 @@ static bool s_enabled = false;
 
 static void ftp_log_info(const char* m) { LOG ("%s", m); }
 static void ftp_log_err (const char* m) { LOGE("%s", m); }
+extern bool z80_ftp_path_protected(const char* path);
+
+static bool ftp_path_protected(const char* path) {
+  return z80_ftp_path_protected(path);
+}
 
 void ftp_begin(uint16_t port, bool enabled, const char* user, const char* pass) {
   s_enabled = enabled;
@@ -21,6 +26,7 @@ void ftp_begin(uint16_t port, bool enabled, const char* user, const char* pass) 
   cfg.vfs_root   = "/sdcard";
   cfg.log_fn     = ftp_log_info;
   cfg.log_err_fn = ftp_log_err;
+  cfg.path_protected_fn = ftp_path_protected;
   SDFTPServer.begin(cfg);
 }
 

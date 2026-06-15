@@ -24,6 +24,7 @@
 #include "console.h"
 #include "telnet.h"
 #include "ftp.h"
+#include "SD_FTP_Server/src/SD_FTP_Server.h"
 #include "touch.h"
 #include "ui.h"
 #include "src/z80/z80_cpu.h"
@@ -164,6 +165,22 @@ static const String* drive_config(int d) {
     case 3: return &cfg.disk_d;
     default: return &cfg.disk_a;
   }
+}
+
+bool z80_ftp_path_protected(const char* path) {
+  if (!path || !*path) return false;
+  SD_FTP_StorageGuard guard;
+  String candidate(path);
+  candidate.toLowerCase();
+  for (int drive = 0; drive < AltairBios::MAX_DRIVES; drive++) {
+    if (!disks[drive].isOpen()) continue;
+    String image(disks[drive].path());
+    if (!image.startsWith("/")) image = "/" + image;
+    image.toLowerCase();
+    if (image == candidate) return true;
+    if (candidate != "/" && image.startsWith(candidate + "/")) return true;
+  }
+  return false;
 }
 
 static bool mount_drive(uint8_t drive, const char* name) {

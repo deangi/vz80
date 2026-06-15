@@ -34,6 +34,21 @@ static Fifo g_telnet_out;
 static Fifo g_telnet_in;
 static bool g_fifos_inited = false;
 
+enum TelnetRxState : uint8_t {
+  RX_DATA,
+  RX_IAC,
+  RX_IAC_OPTION,
+  RX_SUBNEG,
+  RX_SUBNEG_IAC
+};
+static TelnetRxState g_rx_state = RX_DATA;
+static bool g_rx_after_cr = false;
+
+static void reset_rx_parser() {
+  g_rx_state = RX_DATA;
+  g_rx_after_cr = false;
+}
+
 static void ensure_fifos_inited() {
   if (g_fifos_inited) return;
   g_telnet_out.init(telnet_out_storage, TELNET_FIFO_BYTES);
@@ -55,6 +70,7 @@ static void send_iac(uint8_t verb, uint8_t opt) {
 }
 
 static void on_connect() {
+  reset_rx_parser();
   IPAddress ip = g_client.remoteIP();
   strncpy(g_client_ip, ip.toString().c_str(), sizeof(g_client_ip) - 1);
   g_client_ip[sizeof(g_client_ip) - 1] = 0;
@@ -72,24 +88,49 @@ static void drain_rx() {
     if (ch < 0) break;
     uint8_t c = (uint8_t)ch;
 
-    if (c == T_IAC) {
-      int verb = g_client.read();
-      if (verb == T_SB) {
-        int prev = -1, b;
-        while ((b = g_client.read()) >= 0) {
-          if (prev == T_IAC && b == T_SE) break;
-          prev = b;
+    switch (g_rx_state) {
+      case RX_DATA:
+        if (c == T_IAC) {
+          g_rx_state = RX_IAC;
+          break;
         }
-      } else if (verb == T_WILL || verb == T_WONT ||
-                 verb == T_DO   || verb == T_DONT) {
-        g_client.read();
+        if (g_rx_after_cr && (c == 0x00 || c == 0x0A)) {
+          g_rx_after_cr = false;
+          break;
+        }
+        g_rx_after_cr = false;
+        g_telnet_in.push(c);
+        if (c == 0x0D) g_rx_after_cr = true;
+        break;
+
+      case RX_IAC:
+        if (c == T_IAC) {
+          g_telnet_in.push(T_IAC);
+          g_rx_state = RX_DATA;
+        } else if (c == T_SB) {
+          g_rx_state = RX_SUBNEG;
+        } else if (c == T_WILL || c == T_WONT ||
+                   c == T_DO   || c == T_DONT) {
+          g_rx_state = RX_IAC_OPTION;
+        } else {
+          g_rx_state = RX_DATA;
+        }
+        break;
+
+      case RX_IAC_OPTION:
+        g_rx_state = RX_DATA;
+        break;
+
+      case RX_SUBNEG:
+        if (c == T_IAC) g_rx_state = RX_SUBNEG_IAC;
+        break;
+
+      case RX_SUBNEG_IAC:
+        if (c == T_SE) g_rx_state = RX_DATA;
+        else           g_rx_state = RX_SUBNEG;
+        break;
       }
-      continue;
     }
-    if (c == 0x00) continue;
-    if (c == 0x0A) continue;
-    g_telnet_in.push(c);
-  }
 }
 
 bool telnet_in_pop(uint8_t* out) {
@@ -111,6 +152,7 @@ void telnet_poll() {
         (unsigned)g_port, WiFi.localIP().toString().c_str());
   } else if (!wifi_up && g_started) {
     if (g_client) g_client.stop();
+    reset_rx_parser();
     g_client_ip[0] = 0;
     g_telnet_out.clear();
     g_started = false;
@@ -142,6 +184,7 @@ void telnet_poll() {
     }
   } else if (g_client) {
     g_client.stop();
+    reset_rx_parser();
     g_client_ip[0] = 0;
     g_telnet_out.clear();
     LOG("telnet: client disconnected");

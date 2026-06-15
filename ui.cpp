@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "SD_FTP_Server/src/SD_FTP_Server.h"
 #include "config.h"
 #include "appconfig.h"
 #include "platform.h"
@@ -102,6 +103,7 @@ static bool supported_disk_ext(const char* base) {
 }
 
 static void scan_disk_files() {
+  SD_FTP_StorageGuard guard;
   g_file_count = 0;
   fs::File root = SD_MMC.open("/");
   if (!root) return;
