@@ -18,13 +18,25 @@ extern "C" {
 //   0xF03A  pWRITE    write sector from DMA addr; Z=success
 //
 // We install at each entry a 3-byte trap stub: OUT (port), A ; RET.
-// AltairBios::handleOut() is called by Z80CPU::s_out for trap ports 0xC0..0xC5
-// and performs the requested disk operation, setting z->zf for read/write.
+// Cold boot may first load an optional SD PROM image ([system] prom= /
+// prom_addr= in z80config.ini); installStubs() then overlays these 18 bytes
+// so SD .dsk I/O still works. AltairBios::handleOut() is called by
+// Z80CPU::s_out for trap ports 0xC0..0xC5 and performs the requested disk
+// operation, setting z->zf for read/write.
+//
+// SETTRK currently uses C only (8-bit track). An 8 MB CP/M HDD needs
+// SETTRK = ((B<<8)|C) plus a guest DPB — see src/cpm/hdd8mb.md.
+//
+// After CP/M is resident, installListStubs() writes LIST/LISTST routines that
+// drive 88-LPC ports 02h/03h and patches the BIOS jump table so LST: always
+// uses the host line-printer capture (regardless of IOBYTE).
 
 class AltairBios {
 public:
     static constexpr uint8_t  TRAP_PORT_BASE = 0xC0;  // 0xC0..0xC5
     static constexpr uint16_t PROM_BASE      = 0xF02B;
+    // LIST / LISTST code lives just above the disk PROM traps.
+    static constexpr uint16_t LIST_STUB_BASE = 0xF040;
 
     enum DriveLetter : uint8_t { A = 0, B = 1, C = 2, D = 3, MAX_DRIVES = 4 };
 
@@ -35,6 +47,11 @@ public:
     // Install the 6 trap stubs into the Z80 RAM at PROM_BASE.
     // ram[] must be the 64KB Z80 memory array.
     void installStubs(uint8_t* ram);
+
+    // Install LIST/LISTST (88-LPC) and patch BIOS JMP LIST / JMP LISTST.
+    // Safe to call once page-0 WBOOT vector is valid (after CP/M boots).
+    // Returns true if the jump table was patched.
+    bool installListStubs(uint8_t* ram);
 
     // Called from Z80CPU::s_out for trap ports 0xC0..0xC5. Returns true if the
     // port was handled (disk op).

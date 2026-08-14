@@ -5,6 +5,7 @@ _upstream_*
 build/
 .build-codex/
 *.bin
+!Z80SdCard/icom-prom.bin
 
 # SD-card payloads/examples that are too large or user-specific for git.
 Z80SdCard/wificonfig-dean.ini

@@ -2,8 +2,13 @@
 
 // ---- App metadata ----
 #define APP_TITLE       "vZ80"
-#define APP_VERSION     "V2.3"
-#define APP_BUILD_DATE  "2026-06-14"
+#define APP_VERSION     "V2.5"
+#define APP_BUILD_DATE  "2026-08-13"
+
+// Freenove 2.8" only. LovyanGFX / CrowPanel is not built in this tree.
+#define VPDP_DISPLAY_TFT_ESPI    1
+#define VPDP_DISPLAY_LOVYANGFX   2
+#define VPDP_DISPLAY_BACKEND     VPDP_DISPLAY_TFT_ESPI
 
 // ---- RGB LED (WS2812) ----
 #define LED_PIN         42
@@ -37,6 +42,10 @@
 #define SD_MMC_D1       41
 #define SD_MMC_D2       48
 #define SD_MMC_D3       47
+// FatFS VFS slots (SD_MMC.begin maxOpenFiles). Default in Arduino-ESP32 is 5.
+// We need at least 6 simultaneous opens (e.g. A–D .dsk + LP capture +
+// Telnet/FTP). Cap at 10; ~0.5–1 KB heap per slot.
+#define SD_MMC_MAX_OPEN_FILES 10
 
 // ---- File paths on SD ----
 #define WIFI_CFG_PATH   "/wificonfig.ini"

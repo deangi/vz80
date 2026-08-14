@@ -5,6 +5,8 @@
 // ESP32S3 Dev Module board, 16Mb Flash, 8Mb PSRAM, 2.8" dispay with capacitive touch screen
 // Partition: 16M flash (3Mb app/9.9Mb SPIFAT)
 // Tools: CDC On Boot=true
+// Dean Gienger, Cursor, Aug 13, 2026, Freenove ESP32S3 dev board with 2.8 TFT
+//
 //----------------------------------------------------------------------------
 
 #include <Arduino.h>
@@ -12,6 +14,7 @@
 #include <TFT_eSPI.h>
 #include <SD_MMC.h>
 #include <FS.h>
+#include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/stream_buffer.h>
@@ -23,10 +26,17 @@
 #include "appconfig.h"
 #include "console.h"
 #include "telnet.h"
+#include "telnet_shell.h"
 #include "ftp.h"
 #include "SD_FTP_Server/src/SD_FTP_Server.h"
 #include "touch.h"
 #include "ui.h"
+#include "host_time.h"
+#include "host_lib/net/wifi_sta.h"
+#include "host_lib/net/net_task.h"
+#include "host_lib/boot/boot_input.h"
+#include "lp_capture.h"
+#include "vz80_host.h"
 #include "src/z80/z80_cpu.h"
 #include "src/storage/disk_image.h"
 #include "src/cpm/altair_bios.h"
@@ -42,7 +52,7 @@ static SemaphoreHandle_t g_ui_mutex = nullptr;
 
 static Z80CPU cpu;
 static AltairBios bios;
-static DiskImage disks[AltairBios::MAX_DRIVES];
+DiskImage disks[AltairBios::MAX_DRIVES];
 static StreamBufferHandle_t txStream = nullptr;  // Z80 -> console/Telnet
 static StreamBufferHandle_t rxStream = nullptr;  // Serial/Telnet -> Z80
 static KeyboardModal keyboard;
@@ -50,6 +60,9 @@ static KeyboardModal keyboard;
 static volatile uint32_t g_last_cycles = 0;
 static volatile bool g_boot_ok = false;
 static volatile bool g_keyboard_open = false;
+static volatile bool g_guest_restart_req = false;
+static bool g_prompt_seen = false;
+static bool g_list_patched = false;
 
 enum {
   ROW_PSRAM = 0, ROW_SD, ROW_CFG, ROW_WIFI, ROW_IP, ROW_CPU
@@ -82,6 +95,11 @@ static void tft_status(int row, const char* label, const char* value, uint16_t c
   tft.print(value);
 }
 
+static void on_wifi_up() {
+  if (!host_time_synced())
+    host_time_begin(cfg.ntp_enabled, cfg.ntp_server.c_str());
+}
+
 static void wifi_connect() {
   const char* ssid = cfg.wifi_ssid.c_str();
   const char* pass = cfg.wifi_password.c_str();
@@ -94,27 +112,14 @@ static void wifi_connect() {
     return;
   }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname(host);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(ssid, pass);
-
-  LOG("WiFi connecting to \"%s\" (hostname=%s) ...", ssid, host);
   tft_status(ROW_WIFI, "WiFi:  ", "connecting...", TFT_YELLOW);
-
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(250);
-    Serial.print('.');
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    LOG("WiFi connected, IP=%s", WiFi.localIP().toString().c_str());
+  host_wifi_set_up_hook(on_wifi_up);
+  HostWifiConnectResult r =
+      host_wifi_connect(ssid, pass, host, WIFI_CONNECT_TIMEOUT_MS);
+  if (r.ok) {
     tft_status(ROW_WIFI, "WiFi:  ", ssid, TFT_GREEN);
     tft_status(ROW_IP,   "IP:    ", WiFi.localIP().toString().c_str(), TFT_GREEN);
   } else {
-    LOGE("WiFi connect timed out");
     tft_status(ROW_WIFI, "WiFi:  ", "not connected", TFT_YELLOW);
     tft_status(ROW_IP,   "IP:    ", "(none)", TFT_DARKGREY);
   }
@@ -183,7 +188,7 @@ bool z80_ftp_path_protected(const char* path) {
   return false;
 }
 
-static bool mount_drive(uint8_t drive, const char* name) {
+static bool mount_drive(uint8_t drive, const char* name, bool writable = true) {
   if (drive >= AltairBios::MAX_DRIVES) return false;
 
   DiskImage* img = &disks[drive];
@@ -202,7 +207,7 @@ static bool mount_drive(uint8_t drive, const char* name) {
   uint8_t spt = 26;
   uint16_t bytes = 128;
 
-  if (!img->open(path, tracks, spt, bytes, true)) {
+  if (!img->open(path, tracks, spt, bytes, writable)) {
     LOGE("mount %c: FAIL %s", 'A' + drive, path);
     return false;
   }
@@ -233,19 +238,49 @@ static bool ui_mount_drive(uint8_t drive, const char* path) {
   return mount_drive(drive, path);
 }
 
-static void inject_boot_text() {
-  if (!rxStream || cfg.boot_input_len == 0) return;
-  size_t sent = xStreamBufferSend(rxStream, cfg.boot_input, cfg.boot_input_len, 0);
-  LOG("Injected %u/%u boot_text byte(s) into Z80 console input",
-      (unsigned)sent, (unsigned)cfg.boot_input_len);
+bool vz80_mount_drive(uint8_t drive, const char* path, bool writable) {
+  return mount_drive(drive, path, writable);
+}
+
+void vz80_request_guest_restart() { g_guest_restart_req = true; }
+
+bool vz80_consume_guest_restart() {
+  if (!g_guest_restart_req) return false;
+  g_guest_restart_req = false;
+  return true;
+}
+
+static void inject_boot_key(uint8_t c) {
+  if (rxStream) xStreamBufferSend(rxStream, &c, 1, 0);
+}
+
+static void arm_boot_text() {
+  host_boot_input_disarm();
+  if (cfg.boot_input_len == 0) return;
+
+  HostBootInputSegment segs[HOST_BOOT_INPUT_MAX_SEGMENTS];
+  uint8_t n = 0;
+  size_t off = 0;
+  while (off < cfg.boot_input_len && n < HOST_BOOT_INPUT_MAX_SEGMENTS) {
+    size_t chunk = cfg.boot_input_len - off;
+    if (chunk > HostBootInputSegment::DATA_MAX)
+      chunk = HostBootInputSegment::DATA_MAX;
+    segs[n].delay_ms = 0;
+    memcpy(segs[n].data, cfg.boot_input + off, chunk);
+    segs[n].data_len = (uint8_t)chunk;
+    off += chunk;
+    n++;
+  }
+  host_boot_input_arm(segs, n);
 }
 
 static void apply_console_terminal_mode() {
-  ConsoleTerminalMode mode = cfg.terminal.equalsIgnoreCase("adm3a")
-                           ? CONSOLE_TERM_ADM3A
-                           : CONSOLE_TERM_VT100;
-  console_set_terminal_mode(mode);
-  LOG("Console terminal mode: %s", mode == CONSOLE_TERM_ADM3A ? "adm3a" : "vt100");
+  HostTermPersonality mode = cfg.terminal.equalsIgnoreCase("vt100")
+                           ? HOST_TERM_VT100
+                           : HOST_TERM_ADM3A;
+  console_set_personality(mode);
+  LOG("Console terminal mode: %s",
+      mode == HOST_TERM_ADM3A ? "adm3a" : "vt100");
 }
 
 static bool cold_boot_cpm() {
@@ -264,7 +299,12 @@ static bool cold_boot_cpm() {
   LOG("Boot disk %c: %s", 'A' + bs, disks[bs].path());
 
   bios.resetState();
+  config_load_prom(cfg, cpu.ram(), Z80CPU::RAM_SIZE);
+  // Overlay SELDSK..WRITE traps so SD .dsk I/O still works after a PROM load
+  // (or when falling back to the built-in internal PROM copy).
   bios.installStubs(cpu.ram());
+  lp_capture::begin_session();
+  g_list_patched = false;
 
   uint8_t boot[128];
   if (!disks[bs].readSector(0, 1, boot)) {
@@ -274,7 +314,7 @@ static bool cold_boot_cpm() {
 
   cpu.loadProgram(0x0080, boot, sizeof(boot));
   cpu.reset(0x0080);
-  inject_boot_text();
+  host_boot_input_disarm();
   console_init();
   apply_console_terminal_mode();
   console_force_redraw();
@@ -285,6 +325,9 @@ static bool cold_boot_cpm() {
 static void reboot_z80() {
   LOG("Reboot Z80");
   g_boot_ok = false;
+  g_prompt_seen = false;
+  host_boot_input_disarm();
+  telnet_reset_guest_io();
   console_init();
   apply_console_terminal_mode();
   console_force_redraw();
@@ -359,11 +402,29 @@ static void draw_status_bar() {
   tft.drawString(WiFi.status() == WL_CONNECTED
                    ? WiFi.localIP().toString().c_str()
                    : "not connected",
-                 208, sy + 5, 1);
+                 208, sy + 4, 1);
+
+  char utc[32];
   char line[32];
-  snprintf(line, sizeof(line), "%.2f MHz", mhz);
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString(line, 208, sy + 22, 1);
+  if (!cfg.ntp_enabled) {
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawString("NTP off", 208, sy + 14, 1);
+    snprintf(line, sizeof(line), "%.2f MHz", mhz);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString(line, 208, sy + 24, 1);
+  } else if (host_time_format_utc(utc, sizeof(utc))) {
+    utc[10] = 0;  // "YYYY-MM-DD"
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString(utc, 208, sy + 14, 1);
+    snprintf(line, sizeof(line), "%s  %.2f MHz", utc + 11, mhz);
+    tft.drawString(line, 208, sy + 24, 1);
+  } else {
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString("NTP...", 208, sy + 14, 1);
+    snprintf(line, sizeof(line), "%.2f MHz", mhz);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString(line, 208, sy + 24, 1);
+  }
 
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
   tft.drawString(cfg.title.c_str(), 6, sy + 22, 1);
@@ -432,13 +493,11 @@ static void render_task(void* arg) {
   }
 }
 
-static void net_task(void* arg) {
-  (void)arg;
-  for (;;) {
-    telnet_poll();
-    ftp_poll();
-    vTaskDelay(pdMS_TO_TICKS(1));
-  }
+static void start_net_task() {
+  host_net_task_add(telnet_poll);
+  host_net_task_add(ftp_poll);
+  host_net_task_add(host_time_poll);
+  host_net_task_start();
 }
 
 static void z80_task(void* arg) {
@@ -498,6 +557,7 @@ void setup() {
   tft_status(ROW_CPU, "CPU:   ", "Z80 ready", TFT_GREEN);
 
   sd_and_config_init();
+  lp_capture::init();
   wifi_connect();
 
   telnet_begin(cfg.telnet_port, cfg.telnet_enabled);
@@ -508,6 +568,8 @@ void setup() {
   ui_set_drive_mount_callback(ui_mount_drive);
   console_init();
   apply_console_terminal_mode();
+  console_start_output_task();
+  host_boot_input_set_inject(inject_boot_key);
 
   g_ui_mutex = xSemaphoreCreateMutex();
   if (!g_ui_mutex) {
@@ -522,15 +584,13 @@ void setup() {
   led(booted ? 0 : 32, booted ? 0 : 0, booted ? 32 : 0);
 
   xTaskCreatePinnedToCore(render_task, "render", 10240, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(net_task,    "net",     8192, NULL, 2, NULL, 0);
+  start_net_task();
   xTaskCreatePinnedToCore(z80_task,    "z80",     8192, NULL, 3, NULL, 1);
 }
 
 void loop() {
   static bool btn_prev = true;
   static uint32_t last_tap = 0;
-  static uint32_t wifi_ms = 0;
-  static bool prompt_seen = false;
 
   int tx, ty;
   if (touch_poll(&tx, &ty)) {
@@ -557,10 +617,15 @@ void loop() {
   }
   btn_prev = btn_now;
 
-  if (ui_consume_reboot()) {
+  while (Serial.available())
+    enqueue_input((uint8_t)Serial.read());
+  drain_telnet_input();
+  telnet_shell_poll();
+  host_boot_input_poll();
+
+  if (ui_consume_reboot() || vz80_consume_guest_restart()) {
     if (g_keyboard_open) keyboard_close();
     reboot_z80();
-    prompt_seen = false;
     led(0, 0, 32);
   }
   if (ui_consume_esp_restart()) {
@@ -570,23 +635,17 @@ void loop() {
   }
   if (ui_consume_keyboard()) keyboard_open();
 
-  while (Serial.available())
-    enqueue_input((uint8_t)Serial.read());
-  drain_telnet_input();
-
-  uint32_t now = millis();
-  if (now - wifi_ms >= 10000) {
-    wifi_ms = now;
-    if (cfg.wifi_ssid.length() && WiFi.status() != WL_CONNECTED) {
-      LOGE("WiFi link down - reconnecting");
-      WiFi.reconnect();
-    }
-  }
-
-  if (!prompt_seen && console_feed_count() > 0 &&
+  if (!g_prompt_seen && console_feed_count() > 0 &&
       millis() - console_last_feed_ms() > 800) {
-    prompt_seen = true;
+    g_prompt_seen = true;
     led(0, 32, 0);
+    if (!g_list_patched && bios.installListStubs(cpu.ram())) {
+      g_list_patched = true;
+      LOG("CP/M LIST/LISTST → 88-LPC 02h/03h (LP capture %s)",
+          lp_capture::current_path()[0] ? lp_capture::current_path()
+                                        : "(pending)");
+    }
+    arm_boot_text();
   }
 
   delay(1);

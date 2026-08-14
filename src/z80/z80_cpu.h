@@ -26,8 +26,13 @@ class AltairBios;  // forward decl
 //   Altair iCOM 3712 disk PROM trap ports (set by AltairBios::installStubs):
 //     OUT (0xC0..0xC5)  SELDSK / SETTRK / SETSEC / SETDMA / READ / WRITE
 //
+//   Line printer (88-LPC / deramp LST: LPT):
+//     IN  A,(0x02)  status — bit1=1 ready (matches guest LISTST AND 02h)
+//     OUT (0x03),A  data   — 7-bit char into lp_capture FIFO → /LPn.TXT
+//
 // Both SIO ports share the same console stream buffers - the CP/M IOBYTE
-// determines which the BIOS talks to.
+// determines which the BIOS talks to. Host also overlays LIST/LISTST jump
+// table entries so LST: always uses the LPC ports (see AltairBios).
 
 class Z80CPU {
 public:
@@ -36,6 +41,9 @@ public:
     // 88-SIO (inverted)
     static constexpr uint8_t PORT_SIO_STATUS  = 0x00;
     static constexpr uint8_t PORT_SIO_DATA    = 0x01;
+    // 88-LPC (Okidata / deramp LPT)
+    static constexpr uint8_t PORT_LPC_STATUS  = 0x02;
+    static constexpr uint8_t PORT_LPC_DATA    = 0x03;
     // 88-2SIO port 1 (non-inverted)
     static constexpr uint8_t PORT_2SIO_STATUS = 0x10;
     static constexpr uint8_t PORT_2SIO_DATA   = 0x11;

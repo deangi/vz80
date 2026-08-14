@@ -3,8 +3,10 @@
 #include "platform.h"
 #include "secrets.h"
 #include "SD_FTP_Server/src/SD_FTP_Server.h"
+#include "host_lib/net/net_ini.h"
 
 #include <SD_MMC.h>
+#include <stdlib.h>
 #include <string.h>
 
 // -------- helpers --------
@@ -20,11 +22,6 @@ static String to_lower(const String& s) {
   String t = s;
   t.toLowerCase();
   return t;
-}
-
-static bool truthy(const String& v) {
-  return v.equalsIgnoreCase("true") || v == "1"
-      || v.equalsIgnoreCase("yes")  || v.equalsIgnoreCase("on");
 }
 
 static int hex_value(char c) {
@@ -63,6 +60,18 @@ static String unquote_config_value(const String& val) {
       return val.substring(1, val.length() - 1);
   }
   return val;
+}
+
+static uint16_t parse_hex_u16(const String& raw, uint16_t fallback) {
+  String s = unquote_config_value(trim(raw));
+  if (s.length() == 0) return fallback;
+  const char* p = s.c_str();
+  if (p[0] == '$') p++;
+  else if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+  char* end = nullptr;
+  unsigned long v = strtoul(p, &end, 16);
+  if (!end || end == p || v > 0xFFFFUL) return fallback;
+  return (uint16_t)v;
 }
 
 static void config_set_boot_input(AppConfig& cfg, const String& encoded) {
@@ -154,7 +163,8 @@ static String escaped_bytes(const uint8_t* bytes, size_t len) {
 
 bool sd_mount() {
   SD_MMC.setPins(SD_MMC_CLK, SD_MMC_CMD, SD_MMC_D0, SD_MMC_D1, SD_MMC_D2, SD_MMC_D3);
-  if (!SD_MMC.begin("/sdcard", false /*1bit*/, false /*format*/, 20000 /*freq*/)) {
+  if (!SD_MMC.begin("/sdcard", false /*1bit*/, false /*format*/, 20000 /*freq*/,
+                    SD_MMC_MAX_OPEN_FILES)) {
     LOGE("SD_MMC.begin() failed");
     return false;
   }
@@ -168,7 +178,8 @@ bool sd_mount() {
                     : (type == CARD_SDHC) ? "SDHC"
                                           : "?";
   uint64_t mb = SD_MMC.cardSize() / (1024ULL * 1024ULL);
-  LOG("SD mounted: type=%s size=%llu MB", tname, (unsigned long long)mb);
+  LOG("SD mounted: type=%s size=%llu MB maxOpenFiles=%u",
+      tname, (unsigned long long)mb, (unsigned)SD_MMC_MAX_OPEN_FILES);
   return true;
 }
 
@@ -181,6 +192,9 @@ void config_apply_compiled_defaults(AppConfig& cfg) {
   cfg.wifi_password = WIFI_PASS;
   cfg.wifi_hostname = WIFI_HOSTNAME;
 
+  cfg.ntp_enabled = true;
+  cfg.ntp_server  = "pool.ntp.org";
+
   cfg.telnet_enabled = true;
   cfg.telnet_port    = TELNET_PORT;
 
@@ -190,7 +204,9 @@ void config_apply_compiled_defaults(AppConfig& cfg) {
   cfg.ftp_password = FTP_DEFAULT_PASS;
 
   cfg.boot_input_len = 0;
-  cfg.terminal       = "vt100";
+  cfg.terminal       = "adm3a";
+  cfg.prom_path     = "";
+  cfg.prom_addr     = 0xF000;
 
   cfg.disk_a        = DEFAULT_A_IMG;
   cfg.disk_b        = "";
@@ -202,6 +218,34 @@ void config_apply_compiled_defaults(AppConfig& cfg) {
 // -------- parser --------
 
 enum ConfigDomain : uint8_t { CONFIG_NETWORK, CONFIG_EMULATOR };
+
+static void net_cfg_from_app(HostNetConfig& n, const AppConfig& cfg) {
+  n.wifi_ssid = cfg.wifi_ssid;
+  n.wifi_password = cfg.wifi_password;
+  n.wifi_hostname = cfg.wifi_hostname;
+  n.ntp_enabled = cfg.ntp_enabled;
+  n.ntp_server = cfg.ntp_server;
+  n.telnet_enabled = cfg.telnet_enabled;
+  n.telnet_port = cfg.telnet_port;
+  n.ftp_enabled = cfg.ftp_enabled;
+  n.ftp_port = cfg.ftp_port;
+  n.ftp_user = cfg.ftp_user;
+  n.ftp_password = cfg.ftp_password;
+}
+
+static void net_cfg_to_app(AppConfig& cfg, const HostNetConfig& n) {
+  cfg.wifi_ssid = n.wifi_ssid;
+  cfg.wifi_password = n.wifi_password;
+  cfg.wifi_hostname = n.wifi_hostname;
+  cfg.ntp_enabled = n.ntp_enabled;
+  cfg.ntp_server = n.ntp_server;
+  cfg.telnet_enabled = n.telnet_enabled;
+  cfg.telnet_port = n.telnet_port;
+  cfg.ftp_enabled = n.ftp_enabled;
+  cfg.ftp_port = n.ftp_port;
+  cfg.ftp_user = n.ftp_user;
+  cfg.ftp_password = n.ftp_password;
+}
 
 static void parse_line(AppConfig& cfg, String& section, const String& raw,
                        ConfigDomain domain) {
@@ -218,23 +262,23 @@ static void parse_line(AppConfig& cfg, String& section, const String& raw,
   String key = to_lower(trim(t.substring(0, eq)));
   String val = strip_inline_comment(t.substring(eq + 1));
 
-  bool network_section = section == "wifi" || section == "telnet" || section == "ftp";
+  bool network_section = host_net_ini_is_section(section.c_str());
   if ((domain == CONFIG_NETWORK) != network_section) return;
+
+  if (network_section) {
+    HostNetConfig n;
+    net_cfg_from_app(n, cfg);
+    host_net_ini_apply(n, section.c_str(), key.c_str(), val.c_str());
+    net_cfg_to_app(cfg, n);
+    return;
+  }
 
   if (section == "system") {
     if (key == "title") cfg.title = val;
-  } else if (section == "wifi") {
-    if      (key == "ssid")     cfg.wifi_ssid     = val;
-    else if (key == "password") cfg.wifi_password = val;
-    else if (key == "hostname") cfg.wifi_hostname = val;
-  } else if (section == "telnet") {
-    if      (key == "enabled")  cfg.telnet_enabled = truthy(val);
-    else if (key == "port")     cfg.telnet_port    = val.toInt();
-  } else if (section == "ftp") {
-    if      (key == "enabled")  cfg.ftp_enabled  = truthy(val);
-    else if (key == "port")     cfg.ftp_port     = val.toInt();
-    else if (key == "user")     cfg.ftp_user     = val;
-    else if (key == "password") cfg.ftp_password = val;
+    else if (key == "prom" || key == "prom_path" || key == "bios_prom")
+      cfg.prom_path = unquote_config_value(val);
+    else if (key == "prom_addr" || key == "prom_base")
+      cfg.prom_addr = parse_hex_u16(val, 0xF000);
   } else if (section == "console") {
     if      (key == "terminal") cfg.terminal = to_lower(unquote_config_value(val));
     else if (key == "boot_text" || key == "boot_input" ||
@@ -293,6 +337,7 @@ bool config_load_wifi(AppConfig& cfg) {
   if (cfg.wifi_ssid.length() == 0)     cfg.wifi_ssid     = WIFI_SSID;
   if (cfg.wifi_password.length() == 0) cfg.wifi_password = WIFI_PASS;
   if (cfg.wifi_hostname.length() == 0) cfg.wifi_hostname = WIFI_HOSTNAME;
+  if (cfg.ntp_server.length() == 0)    cfg.ntp_server    = "pool.ntp.org";
   if (cfg.telnet_port <= 0)            cfg.telnet_port    = TELNET_PORT;
   if (cfg.ftp_port <= 0)               cfg.ftp_port       = FTP_PORT;
   if (cfg.ftp_user.length() == 0)      cfg.ftp_user       = FTP_DEFAULT_USER;
@@ -307,7 +352,9 @@ bool config_load_vz80(AppConfig& cfg) {
   cfg.disk_c = "";
   cfg.disk_d = "";
   cfg.boot_input_len = 0;
-  cfg.terminal = "vt100";
+  cfg.terminal = "adm3a";
+  cfg.prom_path = "";
+  cfg.prom_addr = 0xF000;
 
   bool existed = parse_config_file(cfg, VZ80_CFG_PATH, CONFIG_EMULATOR);
   if (!existed) {
@@ -317,7 +364,7 @@ bool config_load_vz80(AppConfig& cfg) {
     cfg.disk_b     = "";
     cfg.disk_c     = DEFAULT_C_IMG;
     cfg.disk_d     = "";
-    cfg.terminal   = "vt100";
+    cfg.terminal   = "adm3a";
     cfg.boot_drive = 'a';
     config_write_default_vz80(cfg);
     return false;
@@ -325,8 +372,8 @@ bool config_load_vz80(AppConfig& cfg) {
   if (cfg.title.length() == 0) cfg.title = APP_TITLE;
   if (!(cfg.terminal.equalsIgnoreCase("adm3a") ||
         cfg.terminal.equalsIgnoreCase("vt100"))) {
-    LOGE("[console] unknown terminal=\"%s\" - using vt100", cfg.terminal.c_str());
-    cfg.terminal = "vt100";
+    LOGE("[console] unknown terminal=\"%s\" - using adm3a", cfg.terminal.c_str());
+    cfg.terminal = "adm3a";
   }
   return true;
 }
@@ -344,6 +391,11 @@ bool config_write_default_wifi(const AppConfig& cfg) {
   f.println("ssid     = ");
   f.println("password = ");
   f.printf ("hostname = %s\r\n", cfg.wifi_hostname.c_str());
+  f.println();
+  f.println("[ntp]");
+  f.printf ("enabled = %s\r\n", cfg.ntp_enabled ? "true" : "false");
+  f.printf ("server  = %s\r\n",
+            cfg.ntp_server.length() ? cfg.ntp_server.c_str() : "pool.ntp.org");
   f.println();
   f.println("[telnet]");
   f.println("; Raw guest console over Telnet.");
@@ -373,10 +425,15 @@ bool config_write_default_vz80(const AppConfig& cfg) {
   f.println("[system]");
   f.println("; title is the selected emulator profile name shown in the UI.");
   f.printf("title = %s\r\n", cfg.title.c_str());
+  f.println("; Optional iCOM/disk PROM binary loaded into Z80 RAM before boot.");
+  f.println("; Leave blank to use the built-in SELDSK..WRITE trap stubs.");
+  f.println("; After load, host still overlays stubs at 0xF02B for SD disk I/O.");
+  f.printf("prom      = %s\r\n", cfg.prom_path.c_str());
+  f.printf("prom_addr = 0x%04X\r\n", cfg.prom_addr);
   f.println();
   f.println("[console]");
   f.println("; terminal selects the TFT console escape parser: vt100 or adm3a.");
-  f.printf("terminal = %s\r\n", cfg.terminal.length() ? cfg.terminal.c_str() : "vt100");
+  f.printf("terminal = %s\r\n", cfg.terminal.length() ? cfg.terminal.c_str() : "adm3a");
   f.println("; boot_text is injected into the console input queue after each");
   f.println("; Z80 boot/reset. Escapes: \\r \\n \\t \\e \\xHH \\ooo ^C ^[ ^?.");
   f.printf("boot_text = \"%s\"\r\n", escaped_bytes(cfg.boot_input, cfg.boot_input_len).c_str());
@@ -497,7 +554,8 @@ int config_list_variants(const char* prefix, char names[][44], int max) {
 // -------- disk image creation --------
 
 bool ensure_disk_image(const char* path, uint32_t bytes,
-                       bool create_if_missing, const char* label) {
+                       bool create_if_missing, const char* label,
+                       uint8_t fill) {
   SD_FTP_StorageGuard guard;
   if (!path || !*path) return false;
   if (SD_MMC.exists(path)) {
@@ -520,14 +578,19 @@ bool ensure_disk_image(const char* path, uint32_t bytes,
     LOG("[%s] %s missing (not auto-created)", label, path);
     return false;
   }
-  LOG("[%s] creating zeroed %s (%u bytes) - this can take a while ...",
-      label, path, (unsigned)bytes);
+  // CP/M 2.2 blank floppy: fill 0xE5. BDOS treats directory user-code 0xE5 as
+  // unused; FORMAT.COM / mkfs.cpm do the same for the whole media (OFF=2
+  // reserved tracks + 64-entry dir + data). Zero-fill would look like user-0
+  // files and is not a valid empty directory.
+  LOG("[%s] creating %s (%u bytes, fill=0x%02X) ...",
+      label, path, (unsigned)bytes, fill);
   File f = SD_MMC.open(path, FILE_WRITE);
   if (!f) {
     LOGE("[%s] could not create %s", label, path);
     return false;
   }
-  static uint8_t buf[4096] = {0};
+  uint8_t buf[4096];
+  memset(buf, fill, sizeof(buf));
   uint32_t remaining = bytes;
   uint32_t t0 = millis();
   uint32_t lastReport = t0;
@@ -552,14 +615,58 @@ bool ensure_disk_image(const char* path, uint32_t bytes,
   return true;
 }
 
+bool config_load_prom(const AppConfig& cfg, uint8_t* ram, size_t ram_size) {
+  if (!ram || ram_size == 0) return false;
+  if (cfg.prom_path.length() == 0) return true;
+
+  char path[96];
+  const char* name = cfg.prom_path.c_str();
+  if (name[0] == '/') snprintf(path, sizeof(path), "%s", name);
+  else                snprintf(path, sizeof(path), "/%s", name);
+
+  if ((size_t)cfg.prom_addr >= ram_size) {
+    LOG("PROM: prom_addr 0x%04X beyond RAM (%u) — using internal PROM copy",
+        cfg.prom_addr, (unsigned)ram_size);
+    return true;
+  }
+
+  SD_FTP_StorageGuard guard;
+  File f = SD_MMC.open(path, FILE_READ);
+  if (!f) {
+    LOG("PROM: %s not found — using internal PROM copy", path);
+    return true;
+  }
+  uint32_t sz = (uint32_t)f.size();
+  uint32_t max_load = (uint32_t)(ram_size - cfg.prom_addr);
+  uint32_t n = sz < max_load ? sz : max_load;
+  size_t got = f.read(ram + cfg.prom_addr, n);
+  f.close();
+  if (got != n) {
+    LOG("PROM: short read %s (%u/%u) — using internal PROM copy",
+        path, (unsigned)got, (unsigned)n);
+    return true;
+  }
+  if (sz > max_load)
+    LOG("PROM: truncated %s to %u bytes at 0x%04X (file %u)",
+        path, (unsigned)n, cfg.prom_addr, (unsigned)sz);
+  else
+    LOG("PROM: loaded %s (%u bytes) at 0x%04X",
+        path, (unsigned)n, cfg.prom_addr);
+  return true;
+}
+
 // -------- printer --------
 
 void config_print(const AppConfig& cfg) {
   LOG("---- /wificonfig.ini + /z80config.ini effective values ----");
   LOG("[system]  title=\"%s\"", cfg.title.c_str());
+  LOG("[system]  prom=\"%s\" prom_addr=0x%04X",
+      cfg.prom_path.c_str(), cfg.prom_addr);
   LOG("[wifi]    ssid=\"%s\" hostname=\"%s\" (password=%d chars)",
       cfg.wifi_ssid.c_str(), cfg.wifi_hostname.c_str(),
       (int)cfg.wifi_password.length());
+  LOG("[ntp]     enabled=%s server=\"%s\"",
+      cfg.ntp_enabled ? "true" : "false", cfg.ntp_server.c_str());
   LOG("[telnet]  enabled=%s port=%d",
       cfg.telnet_enabled ? "true" : "false", cfg.telnet_port);
   LOG("[ftp]     enabled=%s port=%d user=\"%s\" (password=%d chars)",

@@ -5,6 +5,7 @@
 #include "platform.h"
 #include "telnet.h"
 #include "ftp.h"
+#include "host_time.h"
 
 #include <Arduino.h>
 #include <TFT_eSPI.h>
@@ -154,12 +155,12 @@ static void rebuild() {
     case SC_MAIN:
       strcpy(g_title, "vZ80 Settings");
       strcpy(g_items[g_count++], "Drives");
+      strcpy(g_items[g_count++], "Reboot Emulator");
       strcpy(g_items[g_count++], "WiFi Config");
       strcpy(g_items[g_count++], "vZ80 Config");
       strcpy(g_items[g_count++], "System Info");
       strcpy(g_items[g_count++], "Brightness");
       strcpy(g_items[g_count++], "Keyboard");
-      strcpy(g_items[g_count++], "Reboot Z80");
       strcpy(g_items[g_count++], "Reset ESP32");
       break;
     case SC_DRIVES:
@@ -301,12 +302,12 @@ static void activate(int idx) {
   switch (g_screen) {
     case SC_MAIN:
       if      (idx == 0) go(SC_DRIVES);
-      else if (idx == 1) { scan_variants("wificonfig-"); go(SC_WIFI_PICKER); }
-      else if (idx == 2) { scan_variants("z80config-"); go(SC_VZ80_PICKER); }
-      else if (idx == 3) go(SC_INFO);
-      else if (idx == 4) go(SC_BRIGHT);
-      else if (idx == 5) { g_keyboard = true; g_screen = SC_CLOSED; g_dirty = true; }
-      else if (idx == 6) { g_reboot = true; g_screen = SC_CLOSED; g_dirty = true; }
+      else if (idx == 1) { g_reboot = true; g_screen = SC_CLOSED; g_dirty = true; }
+      else if (idx == 2) { scan_variants("wificonfig-"); go(SC_WIFI_PICKER); }
+      else if (idx == 3) { scan_variants("z80config-"); go(SC_VZ80_PICKER); }
+      else if (idx == 4) go(SC_INFO);
+      else if (idx == 5) go(SC_BRIGHT);
+      else if (idx == 6) { g_keyboard = true; g_screen = SC_CLOSED; g_dirty = true; }
       else if (idx == 7) go(SC_CONFIRM_RESET);
       break;
     case SC_DRIVES:
@@ -446,6 +447,18 @@ static void draw_info(TFT_eSPI& tft) {
   row(line);
   snprintf(line, sizeof(line), "WiFi: %s", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "not connected");
   row(line, WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_YELLOW);
+  if (!cfg.ntp_enabled) {
+    row("NTP: disabled", COL_DIM);
+  } else if (!host_time_synced()) {
+    row("NTP: waiting for sync...", TFT_YELLOW);
+  } else {
+    char utc[32];
+    if (host_time_format_utc(utc, sizeof(utc)))
+      snprintf(line, sizeof(line), "UTC: %s", utc);
+    else
+      snprintf(line, sizeof(line), "UTC: (unavailable)");
+    row(line, TFT_CYAN);
+  }
   snprintf(line, sizeof(line), "Telnet: %s port %u",
            telnet_connected() ? "connected" : (telnet_listening() ? "listening" : "off"),
            telnet_port());

@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include "config.h"
 
-#define LOG(fmt, ...)   do { Serial.printf("[vZ80] " fmt "\r\n", ##__VA_ARGS__); } while (0)
-#define LOGE(fmt, ...)  do { Serial.printf("[vZ80 ERR] " fmt "\r\n", ##__VA_ARGS__); } while (0)
+#define HOST_LOG_TAG "vZ80"
+#include "host_lib/log/host_log.h"

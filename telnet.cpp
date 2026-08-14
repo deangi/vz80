@@ -1,206 +1,163 @@
 #include "telnet.h"
 #include "platform.h"
-#include "fifo.h"
-#include <WiFi.h>
+#include "telnet_shell.h"
+#include "host_lib/telnet/telnet_pipe.h"
+
+#include <Arduino.h>
 #include "esp_attr.h"
+
 #ifndef EXT_RAM_BSS_ATTR
 #define EXT_RAM_BSS_ATTR
 #endif
 
-// Telnet protocol bytes
-#define T_IAC   255
-#define T_DONT  254
-#define T_DO    253
-#define T_WONT  252
-#define T_WILL  251
-#define T_SB    250
-#define T_SE    240
-#define OPT_BINARY    0
-#define OPT_ECHO      1
-#define OPT_SGA       3
-#define OPT_LINEMODE  34
+#define VZ80_TELNET_OUT_FIFO_BYTES 8192
+#define VZ80_TELNET_DIAG_FIFO_BYTES 2048
+#define VZ80_TELNET_IN_FIFO_BYTES 8192
 
-static WiFiServer  g_server(23);
-static WiFiClient  g_client;
-static bool        g_enabled = false;
-static bool        g_started = false;
-static uint16_t    g_port = 23;
-static char        g_client_ip[20] = {0};
+EXT_RAM_BSS_ATTR static uint8_t telnet_out_storage[VZ80_TELNET_OUT_FIFO_BYTES];
+EXT_RAM_BSS_ATTR static uint8_t telnet_diag_storage[VZ80_TELNET_DIAG_FIFO_BYTES];
+EXT_RAM_BSS_ATTR static uint8_t telnet_in_storage[VZ80_TELNET_IN_FIFO_BYTES];
+static TelnetPipe g_pipe;
+static bool g_inited = false;
 
-#define TELNET_FIFO_BYTES 8192   // must be power of two
-EXT_RAM_BSS_ATTR static uint8_t telnet_out_storage[TELNET_FIFO_BYTES];
-EXT_RAM_BSS_ATTR static uint8_t telnet_in_storage[TELNET_FIFO_BYTES];
-static Fifo g_telnet_out;
-static Fifo g_telnet_in;
-static bool g_fifos_inited = false;
+static uint8_t g_shell_escape_pos = 0;
+static uint32_t g_shell_escape_ms = 0;
+static constexpr uint32_t SHELL_ESCAPE_TIMEOUT_MS = 5000;
 
-enum TelnetRxState : uint8_t {
-  RX_DATA,
-  RX_IAC,
-  RX_IAC_OPTION,
-  RX_SUBNEG,
-  RX_SUBNEG_IAC
-};
-static TelnetRxState g_rx_state = RX_DATA;
-static bool g_rx_after_cr = false;
-
-static void reset_rx_parser() {
-  g_rx_state = RX_DATA;
-  g_rx_after_cr = false;
+static void ensure_pipe() {
+  if (g_inited) return;
+  g_pipe.init(telnet_out_storage, sizeof(telnet_out_storage),
+              telnet_in_storage, sizeof(telnet_in_storage),
+              telnet_diag_storage, sizeof(telnet_diag_storage));
+  g_inited = true;
 }
 
-static void ensure_fifos_inited() {
-  if (g_fifos_inited) return;
-  g_telnet_out.init(telnet_out_storage, TELNET_FIFO_BYTES);
-  g_telnet_in.init(telnet_in_storage,  TELNET_FIFO_BYTES);
-  g_fifos_inited = true;
+static void send_shell_banner() {
+  g_pipe.socket().print(
+      "\r\nvZ80 management shell\r\n"
+      "Z80/CP/M continues; Telnet I/O is temporarily detached.\r\n"
+      "Type help for commands, exit to return to the CP/M console.\r\n"
+      "Escape sequence: ESC >\r\n"
+      "vz80:/> ");
+}
+
+static void enter_shell() {
+  g_pipe.in_clear();
+  g_pipe.out_clear();
+  telnet_shell_enter();
+  send_shell_banner();
+}
+
+static void route_console_input(uint8_t c, void*);
+
+static void expire_shell_escape(void*) {
+  if (!g_shell_escape_pos ||
+      (uint32_t)(millis() - g_shell_escape_ms) < SHELL_ESCAPE_TIMEOUT_MS)
+    return;
+  g_pipe.in_push(0x1b);
+  if (g_shell_escape_pos == 2) g_pipe.in_push('>');
+  g_shell_escape_pos = 0;
+  g_shell_escape_ms = 0;
+}
+
+static void route_console_input(uint8_t c, void*) {
+  if (telnet_shell_active()) {
+    if (c == 0x08 || c == 0x7f) {
+      if (telnet_shell_backspace()) g_pipe.socket().print("\b \b");
+      return;
+    }
+    if (c == '\r' || c == '\n') {
+      telnet_shell_input('\r');
+      g_pipe.socket().print("\r\n");
+      return;
+    }
+    if (telnet_shell_input(c)) g_pipe.socket().write(&c, 1);
+    return;
+  }
+
+  if (g_shell_escape_pos == 0) {
+    if (c == 0x1b) {
+      g_shell_escape_pos = 1;
+      g_shell_escape_ms = millis();
+    } else {
+      g_pipe.in_push(c);
+    }
+    return;
+  }
+  if (g_shell_escape_pos == 1) {
+    if (c == '>') {
+      g_shell_escape_pos = 2;
+      g_shell_escape_ms = millis();
+      return;
+    }
+    g_pipe.in_push(0x1b);
+    g_shell_escape_pos = 0;
+    route_console_input(c, nullptr);
+    return;
+  }
+  if (c == '>') {
+    g_shell_escape_pos = 0;
+    enter_shell();
+    return;
+  }
+  g_pipe.in_push(0x1b);
+  g_pipe.in_push('>');
+  g_shell_escape_pos = 0;
+  route_console_input(c, nullptr);
+}
+
+static size_t shell_aux_peek(const uint8_t** data, void*) {
+  return telnet_shell_output_peek(data);
+}
+
+static void shell_aux_consume(size_t n, void*) {
+  telnet_shell_output_consume(n);
+}
+
+static bool shell_is_active(void*) { return telnet_shell_active(); }
+
+static void on_disconnect(void*) {
+  telnet_shell_disconnect();
+  g_shell_escape_pos = 0;
+  g_shell_escape_ms = 0;
+}
+
+static void install_hooks() {
+  TelnetPipe::Hooks h;
+  h.on_rx = route_console_input;
+  h.after_rx = expire_shell_escape;
+  h.on_disconnect = on_disconnect;
+  h.aux_peek = shell_aux_peek;
+  h.aux_consume = shell_aux_consume;
+  h.shell_active = shell_is_active;
+  h.busy_msg = "\r\nvZ80: console already in use\r\n";
+  h.log_name = "telnet";
+  g_pipe.set_hooks(h);
 }
 
 void telnet_begin(uint16_t port, bool enabled) {
-  ensure_fifos_inited();
-  g_enabled = enabled;
-  g_port    = port;
-  if (!enabled) { LOG("telnet: disabled in config"); return; }
-  LOG("telnet: configured port %u (listener will start when WiFi connects)", port);
+  ensure_pipe();
+  install_hooks();
+  telnet_shell_init();
+  g_pipe.begin(port, enabled);
 }
 
-static void send_iac(uint8_t verb, uint8_t opt) {
-  uint8_t b[3] = { T_IAC, verb, opt };
-  g_client.write(b, 3);
+void telnet_poll() { g_pipe.poll(); }
+
+bool telnet_in_pop(uint8_t* out) { return g_pipe.in_pop(out); }
+
+void telnet_reset_guest_io() {
+  ensure_pipe();
+  g_pipe.reset_guest_io();
+  g_shell_escape_pos = 0;
+  g_shell_escape_ms = 0;
 }
 
-static void on_connect() {
-  reset_rx_parser();
-  IPAddress ip = g_client.remoteIP();
-  strncpy(g_client_ip, ip.toString().c_str(), sizeof(g_client_ip) - 1);
-  g_client_ip[sizeof(g_client_ip) - 1] = 0;
-  LOG("telnet: client connected from %s", g_client_ip);
-  send_iac(T_WILL, OPT_ECHO);
-  send_iac(T_WILL, OPT_SGA);
-  send_iac(T_WONT, OPT_LINEMODE);
-  send_iac(T_DO,   OPT_BINARY);
-  g_telnet_out.clear();
-}
+void telnet_write(uint8_t c) { g_pipe.write(c); }
 
-static void drain_rx() {
-  while (g_client.available()) {
-    int ch = g_client.read();
-    if (ch < 0) break;
-    uint8_t c = (uint8_t)ch;
-
-    switch (g_rx_state) {
-      case RX_DATA:
-        if (c == T_IAC) {
-          g_rx_state = RX_IAC;
-          break;
-        }
-        if (g_rx_after_cr && (c == 0x00 || c == 0x0A)) {
-          g_rx_after_cr = false;
-          break;
-        }
-        g_rx_after_cr = false;
-        g_telnet_in.push(c);
-        if (c == 0x0D) g_rx_after_cr = true;
-        break;
-
-      case RX_IAC:
-        if (c == T_IAC) {
-          g_telnet_in.push(T_IAC);
-          g_rx_state = RX_DATA;
-        } else if (c == T_SB) {
-          g_rx_state = RX_SUBNEG;
-        } else if (c == T_WILL || c == T_WONT ||
-                   c == T_DO   || c == T_DONT) {
-          g_rx_state = RX_IAC_OPTION;
-        } else {
-          g_rx_state = RX_DATA;
-        }
-        break;
-
-      case RX_IAC_OPTION:
-        g_rx_state = RX_DATA;
-        break;
-
-      case RX_SUBNEG:
-        if (c == T_IAC) g_rx_state = RX_SUBNEG_IAC;
-        break;
-
-      case RX_SUBNEG_IAC:
-        if (c == T_SE) g_rx_state = RX_DATA;
-        else           g_rx_state = RX_SUBNEG;
-        break;
-      }
-    }
-}
-
-bool telnet_in_pop(uint8_t* out) {
-  ensure_fifos_inited();
-  return g_telnet_in.pop(out);
-}
-
-void telnet_poll() {
-  ensure_fifos_inited();
-  if (!g_enabled) return;
-
-  bool wifi_up = (WiFi.status() == WL_CONNECTED);
-  if (wifi_up && !g_started) {
-    g_server = WiFiServer(g_port);
-    g_server.begin();
-    g_server.setNoDelay(true);
-    g_started = true;
-    LOG("telnet: listening on port %u at %s",
-        (unsigned)g_port, WiFi.localIP().toString().c_str());
-  } else if (!wifi_up && g_started) {
-    if (g_client) g_client.stop();
-    reset_rx_parser();
-    g_client_ip[0] = 0;
-    g_telnet_out.clear();
-    g_started = false;
-    LOG("telnet: WiFi down, listener stopped");
-  }
-  if (!g_started) return;
-
-  if (g_server.hasClient()) {
-    WiFiClient nc = g_server.available();
-    if (g_client && g_client.connected()) {
-      nc.print("\r\nvZ80: console already in use\r\n");
-      nc.stop();
-    } else {
-      g_client = nc;
-      g_client.setNoDelay(true);
-      on_connect();
-    }
-  }
-
-  if (g_client && g_client.connected()) {
-    drain_rx();
-    const uint8_t* p;
-    size_t n;
-    while ((n = g_telnet_out.peek(&p)) > 0) {
-      size_t w = g_client.write(p, n);
-      if (w == 0) break;
-      g_telnet_out.consume(w);
-      if (w < n) break;
-    }
-  } else if (g_client) {
-    g_client.stop();
-    reset_rx_parser();
-    g_client_ip[0] = 0;
-    g_telnet_out.clear();
-    LOG("telnet: client disconnected");
-  } else {
-    g_telnet_out.clear();
-  }
-}
-
-void telnet_write(uint8_t c) {
-  if (!g_started) return;
-  g_telnet_out.push(c);
-  if (c == T_IAC) g_telnet_out.push(T_IAC);
-}
-
-bool        telnet_connected() { return g_client && g_client.connected(); }
-bool        telnet_listening() { return g_started; }
-const char* telnet_client_ip() { return g_client_ip; }
-uint16_t    telnet_port()      { return g_port; }
-bool        telnet_enabled()   { return g_enabled; }
+bool        telnet_connected() { return g_pipe.connected(); }
+bool        telnet_listening() { return g_pipe.listening(); }
+const char* telnet_client_ip() { return g_pipe.client_ip(); }
+uint16_t    telnet_port()      { return g_pipe.port(); }
+bool        telnet_enabled()   { return g_pipe.enabled(); }
+bool        telnet_shell_connected() { return telnet_shell_active(); }

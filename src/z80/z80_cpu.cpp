@@ -1,5 +1,6 @@
 #include "z80_cpu.h"
 #include "../cpm/altair_bios.h"
+#include "../../lp_capture.h"
 #include <string.h>
 #include <esp_heap_caps.h>
 
@@ -8,13 +9,22 @@ void Z80CPU::begin(StreamBufferHandle_t txOut, StreamBufferHandle_t rxIn) {
     rxIn_  = rxIn;
 
     if (!ram_) {
-        // Allocate from internal 8-bit RAM; every Z80 mem access hits this,
-        // so we don't want PSRAM here even on boards that have it.
-        ram_ = (uint8_t*)heap_caps_malloc(RAM_SIZE, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-        if (!ram_) {
-            Serial.printf("[z80] RAM alloc FAIL (%u bytes)\n", (unsigned)RAM_SIZE);
-            // Fall back to any 8-bit RAM (PSRAM if present). Slow but boots.
-            ram_ = (uint8_t*)heap_caps_malloc(RAM_SIZE, MALLOC_CAP_8BIT);
+        // Prefer PSRAM when present. A 64 KB guest image in internal RAM
+        // starves SDMMC DMA (allocate_dma_buf / err=0x101) once Telnet/FTP
+        // and four open .dsk handles are active. ESP32-S3 cache keeps PSRAM
+        // fast enough for Z80 stepping.
+        ram_ = (uint8_t*)heap_caps_malloc(RAM_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (ram_) {
+            Serial.printf("[z80] RAM %u bytes in PSRAM\n", (unsigned)RAM_SIZE);
+        } else {
+            ram_ = (uint8_t*)heap_caps_malloc(RAM_SIZE, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+            if (ram_)
+                Serial.printf("[z80] RAM %u bytes in internal (no PSRAM)\n",
+                              (unsigned)RAM_SIZE);
+            else {
+                Serial.printf("[z80] RAM alloc FAIL (%u bytes)\n", (unsigned)RAM_SIZE);
+                ram_ = (uint8_t*)heap_caps_malloc(RAM_SIZE, MALLOC_CAP_8BIT);
+            }
         }
     }
 
@@ -104,6 +114,11 @@ uint8_t Z80CPU::s_in(z80* z, uint8_t port) {
             return b;
         }
 
+        // 88-LPC status: ready when capture FIFO can accept a byte.
+        // Guest LISTST does `IN A,(2) / AND 2 / RET Z` — bit1 must be set.
+        case PORT_LPC_STATUS:
+            return lp_capture::free_space() > 0 ? 0x02 : 0x00;
+
         default:
             return 0xFF;
     }
@@ -126,6 +141,10 @@ void Z80CPU::s_out(z80* z, uint8_t port, uint8_t val) {
             if (self->txOut_) {
                 xStreamBufferSend(self->txOut_, &val, 1, 0);
             }
+            break;
+        case PORT_LPC_DATA:
+            // 7-bit printer data (guest BIOS also AND 7Fh before OUT).
+            (void)lp_capture::push(val & 0x7F);
             break;
         // SIO control register writes (port 0/0x10) are init/reset commands -
         // ignore them.
