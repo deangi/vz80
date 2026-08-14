@@ -62,16 +62,18 @@ The on-screen keyboard is retained for direct CP/M input.
 From a Telnet session, type `ESC` then `>` to open the host shell (`ls`,
 `mount A /image.dsk`, `reset`, …). `exit` returns to the CP/M console.
 
-`create` builds a blank CP/M 2.2 floppy image (77×26×128, IBM 3740 / iCOM
-FD3712). The only `<type>` for now is `floppy`. The image is filled with
-`0xE5` (FORMAT / unused directory), not zeros:
+`create` builds blank CP/M 2.2 images filled with `0xE5`:
 
 ```text
 create floppy /scratch.dsk
+create hdd /cpm8mb.hdd
 ```
 
-That initializes reserved tracks 0–1 and a 64-entry empty directory so CP/M
-can `DIR` / save files immediately after `mount`.
+- `floppy` — 77×26×128 (256256 bytes, IBM 3740 / iCOM FD3712)
+- `hdd` — 2048×32×128 (8388608 bytes, CP/M 2.2 max ~8 MB)
+
+After `mount C /cpm8mb.hdd` and `reset`, the host patches the guest DPB
+for HDD drives so CP/M can use the full size (see `src/cpm/hdd8mb.md`).
 
 ## Line printer (LST:)
 
@@ -90,7 +92,6 @@ the earlier CYD sketch is not used in this version.
 Example SD-card config files live in `Z80SdCard/`. Disk images are intentionally
 ignored by Git; copy the required CP/M disk images to the SD card separately.
 
-This version supports standard CP/M floppy disk images only. An 8 MB HDD
-needs a forked guest BIOS/DPB plus 16-bit SETTRK on the host — see
-`src/cpm/hdd8mb.md`. LIST/LST: uses 88-LPC ports `02h`/`03h` and writes
-`/LPn.TXT` on the SD card (same capture path as vpdp LP0).
+This version supports CP/M floppy (`.dsk`) and 8 MB hard-disk (`.hdd`)
+images. HDD details: `src/cpm/hdd8mb.md`. LIST/LST: uses 88-LPC ports
+`02h`/`03h` and writes `/LPn.TXT` on the SD card.

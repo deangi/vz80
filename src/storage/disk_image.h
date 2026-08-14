@@ -3,11 +3,11 @@
 #include <SD_MMC.h>
 #include <FS.h>
 
-// Raw .dsk image on SD: flat (track * sectorsPerTrack + (sector-1)) * sectorBytes.
-// Defaults match the iCOM 3712 / IBM 3740 8" SS-SD format used by deramp's
-// CPM22v1.0-3712-48K.DSK: 77 tracks x 26 sectors x 128 bytes = 256,256 bytes.
+// Raw disk image on SD: flat (track * sectorsPerTrack + (sector-1)) * sectorBytes.
+// Floppy default: iCOM 3712 / IBM 3740 8" SS-SD — 77×26×128 = 256,256 bytes.
+// HDD: 2048×32×128 = 8,388,608 bytes (CP/M 2.2 max). See config.h CPM_* .
 //
-// Sectors are 1-based (CP/M convention). Track is 0-based.
+// Sectors are 1-based (CP/M convention). Track is 0-based (16-bit for HDD).
 class DiskImage {
 public:
     bool open(const char* path,

@@ -91,7 +91,7 @@ static void cmd_create(int argc, char** argv) {
   }
   if (argc < 3) {
     const char* u = g_media->create_usage ? g_media->create_usage() : nullptr;
-    shell_out_text(u && *u ? u : "usage: create floppy <path>\r\n");
+    shell_out_text(u && *u ? u : "usage: create floppy|hdd <path>\r\n");
     return;
   }
   char err[192] = {};
@@ -117,6 +117,6 @@ void shell_register_media_commands() {
                  "dismount <unit>             dismount a drive",
                  dismount_aliases, "Emulator commands");
   shell_register("create", cmd_create,
-                 "create floppy <path>        blank CP/M 2.2 floppy (0xE5 dir); only type for now",
+                 "create floppy|hdd <path>    blank CP/M image (0xE5); floppy=256K, hdd=8MB",
                  nullptr, "Emulator commands");
 }

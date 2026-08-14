@@ -26,8 +26,8 @@ INI `[console] terminal=` selects `HOST_TERM_ADM3A` or `HOST_TERM_VT100`. **Defa
 ## Telnet shell
 
 `ESC` `>` enters the host shell (FS + MediaOps A–D + guest reset). No PDP pack.
-`create` accepts only `floppy` for now (`create floppy <path>` → 77×26×128
-`.dsk` filled with `0xE5` for a blank CP/M 2.2 directory).
+`create` accepts `floppy` (77×26×128 `.dsk`) or `hdd` (2048×32×128
+`.hdd`, 8 MB) filled with `0xE5`.
 
 Optional `[system] prom=` / `prom_addr=` in `z80config.ini` loads a PROM
 binary into Z80 RAM before `installStubs()`.

@@ -60,9 +60,26 @@ data bytes**. With 2 reserved tracks that is an **8,388,608-byte** image
 `SETTRK` must pass a **16-bit** track in BC (`((B<<8)|C)`). Floppy BIOS
 only uses C, so the stock iCOM image cannot address 2048 tracks.
 
-Suggested host image: `/cpm8mb.hdd`, 8,388,608 bytes, `0xE5` fill.
-`DiskImage` already accepts custom track/spt; `AltairBios::handleOut`
-SETTRK still stores `z->c` only and must be changed before mounting HDD.
+`DiskImage` accepts custom track/spt. Host `SETTRK` uses `((B<<8)|C)`.
+Mount auto-detects `.hdd` / 8,388,608-byte images as 2048×32×128.
+`create hdd <path>` builds a blank `0xE5`-filled image.
+After CP/M boots, `installHddDpbs()` finds the DPH table SELDSK returns
+(`LD HL,dph0 / ADD HL,DE`) and patches each mounted `.hdd` drive using
+**standard** CP/M 2.2 DPH offsets: XLT @+0, DPB @+10, CSV @+12, ALV @+14.
+SECTRAN is chained: if DE is the HDD XLT (`0xF110`) it returns physical
+`logical+1` (1..32); otherwise it jumps to the original iCOM skew routine
+so A:/B: floppies keep working. SETTRK/SETSEC/READ/WRITE already go through
+the PROM traps (`0xF02E`..`0xF03A`).
+
+Suggested image: `/cpm8mb.hdd`. Example:
+
+```text
+create hdd /cpm8mb.hdd
+mount C /cpm8mb.hdd
+reset
+```
+
+Then in CP/M: `C:` and `STAT C:`.
 
 Do **not** reuse FDC+ / Altair HDSK binaries unchanged: those talk to
 different controller ports, not the iCOM PROM traps this host implements.

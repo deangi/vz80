@@ -1,18 +1,12 @@
 # cpm/ — CP/M 2.2 BIOS / BDOS emulation
 
-Current disk support is the Altair/iCOM CP/M 2.2 floppy path:
+Current disk support is the Altair/iCOM CP/M 2.2 path:
 - Optional SD PROM image via `[system] prom=` / `prom_addr=` in z80config.ini
 - BIOS/PROM trap stubs at 0xF02B..0xF03A (always overlaid after PROM load)
-- SELDSK / SETTRK / SETSEC / SETDMA / READ / WRITE dispatch
-- 77 tracks x 26 sectors x 128 bytes per mounted `.dsk` image
-- Guest DPB matches IBM-3740 / FD3712: 1 KiB blocks, 64 directory entries
-  (DRM=63), 2 reserved tracks (OFF=2). Blank images are `0xE5`-filled.
-
-Hard-disk image support is intentionally deferred. The ESP32 storage layer can
-address larger files, but CP/M also needs matching BIOS/DPB geometry and
-16-bit SETTRK before the guest can use an 8 MB C:/D: drive. Recipe:
-`hdd8mb.md` (cpuville + [ciernioo](https://ciernioo.wordpress.com/2016/05/11/cpm-2-2-up-and-running/)
-CBIOS walkthroughs).
+- SELDSK / SETTRK (16-bit BC) / SETSEC / SETDMA / READ / WRITE dispatch
+- Floppy: 77×26×128 `.dsk` (IBM-3740 / FD3712 DPB)
+- HDD: 2048×32×128 `.hdd` (8 MB); host patches guest DPH/DPB/ALV after boot
+  (`installHddDpbs`, see `hdd8mb.md`). Blank images are `0xE5`-filled.
 
 ## Line printer (LST:)
 

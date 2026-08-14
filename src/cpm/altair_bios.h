@@ -24,12 +24,13 @@ extern "C" {
 // Z80CPU::s_out for trap ports 0xC0..0xC5 and performs the requested disk
 // operation, setting z->zf for read/write.
 //
-// SETTRK currently uses C only (8-bit track). An 8 MB CP/M HDD needs
-// SETTRK = ((B<<8)|C) plus a guest DPB — see src/cpm/hdd8mb.md.
+// SETTRK uses BC as a 16-bit track (((B<<8)|C)). Floppy images only need C;
+// 8 MB HDD images need the full width — see src/cpm/hdd8mb.md.
 //
 // After CP/M is resident, installListStubs() writes LIST/LISTST routines that
 // drive 88-LPC ports 02h/03h and patches the BIOS jump table so LST: always
 // uses the host line-printer capture (regardless of IOBYTE).
+// installHddDpbs() rewrites DPH/DPB/ALV for drives that host .hdd geometry.
 
 class AltairBios {
 public:
@@ -52,6 +53,11 @@ public:
     // Safe to call once page-0 WBOOT vector is valid (after CP/M boots).
     // Returns true if the jump table was patched.
     bool installListStubs(uint8_t* ram);
+
+    // For each bit in drive_mask, point that drive's DPH at a host-provided
+    // 8 MB DPB + ALV + identity XLT, and install a standard SECTRAN.
+    // Returns number of drives patched.
+    int installHddDpbs(uint8_t* ram, uint8_t drive_mask);
 
     // Called from Z80CPU::s_out for trap ports 0xC0..0xC5. Returns true if the
     // port was handled (disk op).

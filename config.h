@@ -2,8 +2,8 @@
 
 // ---- App metadata ----
 #define APP_TITLE       "vZ80"
-#define APP_VERSION     "V2.5"
-#define APP_BUILD_DATE  "2026-08-13"
+#define APP_VERSION     "V2.6"
+#define APP_BUILD_DATE  "2026-08-14"
 
 // Freenove 2.8" only. LovyanGFX / CrowPanel is not built in this tree.
 #define VPDP_DISPLAY_TFT_ESPI    1
@@ -52,6 +52,16 @@
 #define VZ80_CFG_PATH   "/z80config.ini"
 #define DEFAULT_A_IMG   "/altair48k-boot.dsk"
 #define DEFAULT_C_IMG   ""
+
+// CP/M image geometry (128-byte sectors)
+#define CPM_SEC_BYTES       128u
+#define CPM_FLOPPY_TRACKS   77u
+#define CPM_FLOPPY_SPT      26u
+#define CPM_FLOPPY_BYTES    (CPM_FLOPPY_TRACKS * CPM_FLOPPY_SPT * CPM_SEC_BYTES)
+// 8 MB CP/M 2.2 max (DSM=2045 @ 4 KiB, OFF=2): 2048 trk × 32 spt × 128
+#define CPM_HDD_TRACKS      2048u
+#define CPM_HDD_SPT         32u
+#define CPM_HDD_BYTES       (CPM_HDD_TRACKS * CPM_HDD_SPT * CPM_SEC_BYTES)
 
 // ---- Network ----
 #define TELNET_PORT     23

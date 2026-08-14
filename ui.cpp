@@ -100,7 +100,7 @@ static String* mutable_drive_path(int d) {
 
 static bool supported_disk_ext(const char* base) {
   const char* dot = strrchr(base, '.');
-  return dot && !strcasecmp(dot, ".dsk");
+  return dot && (!strcasecmp(dot, ".dsk") || !strcasecmp(dot, ".hdd"));
 }
 
 static void scan_disk_files() {

@@ -27,8 +27,9 @@ static constexpr size_t SHELL_LINE_MAX = 255;
 static constexpr size_t SHELL_QUEUE_DEPTH = 4;
 static constexpr size_t SHELL_OUTPUT_BYTES = 8192;
 static constexpr size_t SHELL_PATH_MAX = 128;
-static constexpr uint32_t FLOPPY_BYTES = 77u * 26u * 128u;
-static constexpr uint8_t  FLOPPY_FILL  = 0xE5;  // CP/M 2.2 unused dir / FORMAT
+static constexpr uint32_t FLOPPY_BYTES = CPM_FLOPPY_BYTES;
+static constexpr uint32_t HDD_BYTES    = CPM_HDD_BYTES;
+static constexpr uint8_t  DISK_FILL    = 0xE5;  // CP/M 2.2 unused dir / FORMAT
 
 static volatile bool g_active = false;
 static char g_input_line[SHELL_LINE_MAX + 1];
@@ -494,7 +495,8 @@ static bool vz80_media_list(int index, MediaUnitInfo* out) {
   out->mounted = true;
   strncpy(out->path, img.path(), sizeof(out->path) - 1);
   out->size_bytes = (uint32_t)img.tracks() * img.sectorsPerTrack() * img.sectorBytes();
-  strncpy(out->extra, "floppy", sizeof(out->extra) - 1);
+  const char* kind = (img.sectorsPerTrack() == CPM_HDD_SPT) ? "hdd" : "floppy";
+  strncpy(out->extra, kind, sizeof(out->extra) - 1);
   return true;
 }
 
@@ -503,7 +505,7 @@ static const char* vz80_mount_usage() {
 }
 
 static const char* vz80_create_usage() {
-  return "usage: create floppy <path>\r\n";
+  return "usage: create floppy|hdd <path>\r\n";
 }
 
 static bool vz80_media_mount(const char* unit, const char* path, bool readonly,
@@ -541,7 +543,9 @@ static bool vz80_media_dismount(const char* unit, char* err, size_t errlen) {
 
 static bool vz80_media_create(const char* type, const char* path,
                               char* err, size_t errlen) {
-  if (!type || strcasecmp(type, "floppy") != 0) {
+  const bool is_floppy = type && strcasecmp(type, "floppy") == 0;
+  const bool is_hdd    = type && strcasecmp(type, "hdd") == 0;
+  if (!is_floppy && !is_hdd) {
     snprintf(err, errlen, "%s", vz80_create_usage());
     return false;
   }
@@ -550,13 +554,15 @@ static bool vz80_media_create(const char* type, const char* path,
     snprintf(err, errlen, "invalid path");
     return false;
   }
-  if (!ensure_disk_image(full, FLOPPY_BYTES, true, "floppy", FLOPPY_FILL)) {
+  const uint32_t bytes = is_hdd ? HDD_BYTES : FLOPPY_BYTES;
+  const char* label = is_hdd ? "hdd" : "floppy";
+  if (!ensure_disk_image(full, bytes, true, label, DISK_FILL)) {
     snprintf(err, errlen, "create failed");
     return false;
   }
   snprintf(err, errlen,
-           "created %s (%lu bytes, CP/M 2.2 formatted 0xE5)\r\n",
-           full, (unsigned long)FLOPPY_BYTES);
+           "created %s (%lu bytes, CP/M 2.2 %s, fill 0xE5)\r\n",
+           full, (unsigned long)bytes, label);
   return true;
 }
 

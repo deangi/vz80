@@ -203,9 +203,42 @@ static bool mount_drive(uint8_t drive, const char* name, bool writable = true) {
   else                snprintf(path, sizeof(path), "/%s", name);
 
   img->close();
-  uint16_t tracks = 77;
-  uint8_t spt = 26;
-  uint16_t bytes = 128;
+
+  uint16_t tracks = CPM_FLOPPY_TRACKS;
+  uint8_t  spt    = CPM_FLOPPY_SPT;
+  uint16_t bytes  = CPM_SEC_BYTES;
+  const char* kind = "floppy";
+
+  {
+    SD_FTP_StorageGuard guard;
+    fs::File f = SD_MMC.open(path, FILE_READ);
+    if (!f) {
+      LOGE("mount %c: FAIL open %s", 'A' + drive, path);
+      return false;
+    }
+    uint32_t sz = (uint32_t)f.size();
+    f.close();
+
+    const char* dot = strrchr(path, '.');
+    bool ext_hdd = dot && !strcasecmp(dot, ".hdd");
+    if (ext_hdd || sz == CPM_HDD_BYTES) {
+      tracks = CPM_HDD_TRACKS;
+      spt    = CPM_HDD_SPT;
+      kind   = "hdd";
+    } else if (sz == CPM_FLOPPY_BYTES) {
+      tracks = CPM_FLOPPY_TRACKS;
+      spt    = CPM_FLOPPY_SPT;
+      kind   = "floppy";
+    } else if (sz > CPM_FLOPPY_BYTES && (sz % (CPM_HDD_SPT * CPM_SEC_BYTES)) == 0) {
+      // Oversized image with HDD sector/track pitch.
+      uint32_t tr = sz / (CPM_HDD_SPT * CPM_SEC_BYTES);
+      if (tr > 0 && tr <= 65535) {
+        tracks = (uint16_t)tr;
+        spt    = CPM_HDD_SPT;
+        kind   = "hdd";
+      }
+    }
+  }
 
   if (!img->open(path, tracks, spt, bytes, writable)) {
     LOGE("mount %c: FAIL %s", 'A' + drive, path);
@@ -213,8 +246,8 @@ static bool mount_drive(uint8_t drive, const char* name, bool writable = true) {
   }
 
   bios.mount(drive, img);
-  LOG("%c: <- %s (%u trk x %u sec x %u byte)",
-      'A' + drive, path, img->tracks(),
+  LOG("%c: <- %s [%s] (%u trk x %u sec x %u byte)",
+      'A' + drive, path, kind, img->tracks(),
       img->sectorsPerTrack(), img->sectorBytes());
   return true;
 }
@@ -644,6 +677,15 @@ void loop() {
       LOG("CP/M LIST/LISTST → 88-LPC 02h/03h (LP capture %s)",
           lp_capture::current_path()[0] ? lp_capture::current_path()
                                         : "(pending)");
+      uint8_t hdd_mask = 0;
+      for (int d = 0; d < AltairBios::MAX_DRIVES; d++) {
+        if (disks[d].isOpen() && disks[d].sectorsPerTrack() == CPM_HDD_SPT)
+          hdd_mask |= (uint8_t)(1u << d);
+      }
+      if (hdd_mask) {
+        int n = bios.installHddDpbs(cpu.ram(), hdd_mask);
+        LOG("CP/M HDD DPB patched for %d drive(s) mask=0x%02X", n, hdd_mask);
+      }
     }
     arm_boot_text();
   }
