@@ -60,20 +60,70 @@ The on-screen keyboard is retained for direct CP/M input.
 ## Telnet shell
 
 From a Telnet session, type `ESC` then `>` to open the host shell (`ls`,
-`mount A /image.dsk`, `reset`, …). `exit` returns to the CP/M console.
-
-`create` builds blank CP/M 2.2 images filled with `0xE5`:
+`mount`, `create`, `reset`, …). `exit` returns to the CP/M console.
 
 ```text
 create floppy /scratch.dsk
 create hdd /cpm8mb.hdd
+mount C /cpm8mb.hdd
+reset
 ```
 
-- `floppy` — 77×26×128 (256256 bytes, IBM 3740 / iCOM FD3712)
-- `hdd` — 2048×32×128 (8388608 bytes, CP/M 2.2 max ~8 MB)
+- `create floppy <path>` — 77×26×128 (256256 bytes, IBM 3740 / iCOM FD3712)
+- `create hdd <path>` — 2048×32×128 (8388608 bytes, CP/M 2.2 max ~8 MB)
+- `mount <A|B|C|D> <path> [ro]` — attach an existing `.dsk` or `.hdd`
+- `dismount <A|B|C|D>` — detach
+- `reset` — reboot the Z80 (needed after changing media so CP/M sees the new DPB)
 
-After `mount C /cpm8mb.hdd` and `reset`, the host patches the guest DPB
-for HDD drives so CP/M can use the full size (see `src/cpm/hdd8mb.md`).
+Images are filled with `0xE5` (empty CP/M directory). Geometry is taken from
+the file size / `.hdd` extension; you do not set tracks by hand.
+
+## Hard disk (C:)
+
+Keep booting from a floppy (A:) that has CP/M system tracks. A blank `.hdd`
+has no CCP/BDOS; use it as a data drive.
+
+**Telnet (one-time create, then mount):**
+
+```text
+ESC >
+create hdd /cpm8mb.hdd
+mount C /cpm8mb.hdd
+reset
+exit
+```
+
+**Persistent config** in `/z80config.ini` (example: `Z80SdCard/z80config-hdd.ini`).
+Copy that variant over the active config from the Settings menu, or edit:
+
+```ini
+[disks]
+a    = /altair48k-boot.dsk
+b    = /floppy1.dsk
+c    = /cpm8mb.hdd
+d    =
+boot = a
+```
+
+The on-screen disk picker also lists `.hdd` files.
+
+After the CP/M prompt, the host patches drive C’s DPB. Serial log:
+
+```text
+C: <- /cpm8mb.hdd [hdd] (2048 trk x 32 sec x 128 byte)
+CP/M HDD DPB patched for 1 drive(s) mask=0x04
+```
+
+In CP/M:
+
+```text
+STAT C:
+DIR C:
+PIP C:=A:*.*
+```
+
+A blank 8 MB image reports about **8168k** remaining (`STAT C:`). `DIR C:` is
+empty until you copy files. Internals: `src/cpm/hdd8mb.md`.
 
 ## Line printer (LST:)
 
@@ -93,5 +143,5 @@ Example SD-card config files live in `Z80SdCard/`. Disk images are intentionally
 ignored by Git; copy the required CP/M disk images to the SD card separately.
 
 This version supports CP/M floppy (`.dsk`) and 8 MB hard-disk (`.hdd`)
-images. HDD details: `src/cpm/hdd8mb.md`. LIST/LST: uses 88-LPC ports
+images (see **Hard disk (C:)** above). LIST/LST: uses 88-LPC ports
 `02h`/`03h` and writes `/LPn.TXT` on the SD card.
