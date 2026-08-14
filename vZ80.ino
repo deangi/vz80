@@ -379,12 +379,19 @@ static void drain_telnet_input() {
 }
 
 static void drain_z80_output() {
-  uint8_t b;
-  int budget = 768;
-  while (budget-- > 0 && xStreamBufferReceive(txStream, &b, 1, 0) == 1) {
-    console_feed(b);
-    telnet_write(b);
-    Serial.write(b);
+  uint8_t buf[256];
+  for (int round = 0; round < 16; round++) {
+    size_t n = xStreamBufferReceive(txStream, buf, sizeof(buf), 0);
+    if (!n) break;
+    for (size_t i = 0; i < n; i++) {
+      console_feed(buf[i]);
+      telnet_write(buf[i]);
+    }
+    // USB-CDC can block for tens of ms per byte; never stall Telnet on it.
+    if (Serial) {
+      size_t room = Serial.availableForWrite();
+      if (room) Serial.write(buf, n < room ? n : room);
+    }
   }
 }
 
@@ -508,7 +515,6 @@ static void render_task(void* arg) {
       ui_draw(tft);
       xSemaphoreGive(g_ui_mutex);
     } else {
-      drain_z80_output();
       console_render(tft);
       if (kbd) {
         xSemaphoreTake(g_ui_mutex, portMAX_DELAY);
@@ -540,6 +546,7 @@ static void z80_task(void* arg) {
       cpu.runCycles(40000);
       g_last_cycles = cpu.cpu()->cyc;
     }
+    drain_z80_output();
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
